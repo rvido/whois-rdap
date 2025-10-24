@@ -20,7 +20,7 @@ A simple command-line tool to query RDAP servers for IP address information. Thi
 
 1.  Clone the repository:
     ```sh
-    git clone https://github.com/rvido/whois-rdap.git
+    git clone <repository-url>
     cd whois-rdap
     ```
 
