@@ -446,6 +446,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn test_rdap_registry_from_str() {
+        assert_eq!(RdapRegistry::from_str("ripe").unwrap(), RdapRegistry::RIPE);
+        assert_eq!(RdapRegistry::from_str("ARIN").unwrap(), RdapRegistry::ARIN);
+        assert!(RdapRegistry::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn test_trim_trailing_slash() {
+        assert_eq!(trim_trailing_slash("https://example.test/"), "https://example.test");
+        assert_eq!(trim_trailing_slash("https://example.test"), "https://example.test");
+    }
+
+    #[test]
     fn test_parse_as_number() {
         assert_eq!(parse_as_number("AS15169"), Some(15169));
         assert_eq!(parse_as_number("15169"), Some(15169));
@@ -490,5 +503,65 @@ mod tests {
             }]
         });
         assert_eq!(extract_as_number(&json), None);
+    }
+
+    #[test]
+    fn test_extract_org_prefers_ranked_vcard_name() {
+        let json = json!({
+            "entities": [
+                {
+                    "handle": "LOWER-RANKED",
+                    "roles": ["technical"]
+                },
+                {
+                    "handle": "BETTER-RANKED",
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [
+                        ["fn", {}, "text", "Example Org"],
+                        ["org", {}, "text", "Fallback Org"]
+                    ]]
+                }
+            ]
+        });
+
+        assert_eq!(extract_org(&json), Some("Example Org".to_string()));
+    }
+
+    #[test]
+    fn test_extract_org_falls_back_to_handle() {
+        let json = json!({
+            "entities": [
+                {
+                    "handle": "ORG-HANDLE",
+                    "roles": ["abuse"]
+                }
+            ]
+        });
+
+        assert_eq!(extract_org(&json), Some("ORG-HANDLE".to_string()));
+    }
+
+    #[test]
+    fn test_extract_cidrs_and_range() {
+        let json = json!({
+            "cidr0_cidrs": [
+                {"v4prefix": "192.0.2.0", "length": 24},
+                {"v6prefix": "2001:db8::", "length": 32}
+            ],
+            "startAddress": "192.0.2.0",
+            "endAddress": "192.0.2.255"
+        });
+
+        assert_eq!(extract_cidrs(&json), vec!["192.0.2.0/24", "2001:db8::/32"]);
+        assert_eq!(extract_range(&json), Some(("192.0.2.0".to_string(), "192.0.2.255".to_string())));
+    }
+
+    #[test]
+    fn test_extract_cidrs_falls_back_to_handle_cidr() {
+        let json = json!({
+            "handle": "198.51.100.0/24"
+        });
+
+        assert_eq!(extract_cidrs(&json), vec!["198.51.100.0/24"]);
     }
 }
