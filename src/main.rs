@@ -1,5 +1,5 @@
 // A simple command-line tool to query RDAP servers for IP address information.
-// Copyright (c) 2025 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
 
 use anyhow::{Result, anyhow};
 use clap::{ArgGroup, Parser, ValueHint};

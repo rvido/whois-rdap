@@ -1,5 +1,5 @@
 // Rust RDAP client library to query RDAP servers for IP address information.
-// Copyright (c) 2025 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
