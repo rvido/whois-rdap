@@ -3,6 +3,7 @@
 
 use anyhow::{Result, anyhow};
 use clap::{ArgGroup, Parser, ValueHint};
+use serde_json::{Map, Value};
 use std::net::IpAddr;
 use std::time::Duration;
 use whois_rdap::{RdapClient, RdapRegistry};
@@ -38,6 +39,10 @@ struct Args {
     /// Request timeout in seconds.
     #[arg(long, default_value_t = 15)]
     timeout: u64,
+
+    /// Print successful lookup output as a compact JSON string.
+    #[arg(long, action)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -70,25 +75,67 @@ async fn main() -> Result<()> {
     // Perform lookup
     match client.lookup_ip(ip).await {
         Ok(res) => {
-            println!("IP: {}", ip);
-            println!("RDAP Server: {}", base_url); // <- print the string, not the client
-            println!(
-                "Organization: {}",
-                res.organization.as_deref().unwrap_or("Unknown")
-            );
+            if args.json {
+                let mut out = Map::new();
+                out.insert("ip".to_string(), Value::String(ip.to_string()));
+                out.insert("rdap_server".to_string(), Value::String(base_url));
+                out.insert(
+                    "organization".to_string(),
+                    Value::String(res.organization.unwrap_or_else(|| "Unknown".to_string())),
+                );
 
-            if let Some(as_num) = res.as_number {
-                println!("AS Number: AS{}", as_num);
-            }
+                if let Some(country_code) = res.country_code {
+                    out.insert("country_code".to_string(), Value::String(country_code));
+                }
 
-            if !res.cidrs.is_empty() {
-                println!("CIDR(s): {}", res.cidrs.join(", "));
-            }
-            if let Some((ref start, ref end)) = res.range {
-                println!("Range: {} - {}", start, end);
-            }
-            if res.cidrs.is_empty() && res.range.is_none() {
-                println!("CIDR/Range: Not found in RDAP response");
+                if let Some(as_num) = res.as_number {
+                    out.insert("as_number".to_string(), Value::String(format!("AS{}", as_num)));
+                }
+
+                if !res.cidrs.is_empty() {
+                    out.insert(
+                        "cidrs".to_string(),
+                        Value::String(res.cidrs.join(", ")),
+                    );
+                }
+
+                if let Some((start, end)) = res.range {
+                    out.insert("range".to_string(), Value::String(format!("{} - {}", start, end)));
+                }
+
+                if !out.contains_key("cidrs") && !out.contains_key("range") {
+                    out.insert(
+                        "cidr_range".to_string(),
+                        Value::String("Not found in RDAP response".to_string()),
+                    );
+                }
+
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                println!("IP: {}", ip);
+                println!("RDAP Server: {}", base_url); // <- print the string, not the client
+                println!(
+                    "Organization: {}",
+                    res.organization.as_deref().unwrap_or("Unknown")
+                );
+
+                if let Some(country_code) = res.country_code {
+                    println!("Country Code: {}", country_code);
+                }
+
+                if let Some(as_num) = res.as_number {
+                    println!("AS Number: AS{}", as_num);
+                }
+
+                if !res.cidrs.is_empty() {
+                    println!("CIDR(s): {}", res.cidrs.join(", "));
+                }
+                if let Some((ref start, ref end)) = res.range {
+                    println!("Range: {} - {}", start, end);
+                }
+                if res.cidrs.is_empty() && res.range.is_none() {
+                    println!("CIDR/Range: Not found in RDAP response");
+                }
             }
         }
         Err(e) => {

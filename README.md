@@ -58,12 +58,18 @@ rdap-whois [OPTIONS] <IP>
     ./target/release/whois-rdap --list-servers
     ```
 
+-   Print a successful lookup as a compact JSON string:
+    ```sh
+    ./target/release/whois-rdap --json 8.8.8.8
+    ```
+
 ### Options
 
 -   `<IP>`: The IPv4 or IPv6 address to look up.
 -   `--rir <RIR>`: Pick a known RDAP server. (e.g., `ripe`, `arin`, `apnic`, `lacnic`, `afrinic`, `iana`)
 -   `--server <URL>`: Use a custom RDAP server base URL.
 -   `--list-servers`: List all known servers and exit.
+-   `--json`: Print successful lookup output as a compact JSON string.
 -   `--timeout <SECONDS>`: Request timeout in seconds (default: 15).
 -   `-h, --help`: Print help information.
 -   `-V, --version`: Print version information.

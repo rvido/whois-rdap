@@ -2,6 +2,7 @@
 // Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 use serde_json::Value;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -91,10 +92,12 @@ impl RdapRegistry {
 }
 
 /// Result of an RDAP IP lookup.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RdapResult {
     /// Best-effort organization name, if found.
     pub organization: Option<String>,
+    /// Country code, if available as an ISO-like 2-letter value.
+    pub country_code: Option<String>,
     /// CIDR(s) if provided via cidr0_cidrs or similar fields.
     pub cidrs: Vec<String>,
     /// Inclusive IP range (start, end), if present.
@@ -128,7 +131,7 @@ impl RdapClient {
         Ok(Self { http, base })
     }
 
-    /// Lookup an IP (v4 or v6) and extract org + CIDRs + range.
+    /// Lookup an IP (v4 or v6) and extract org + country + CIDRs + range.
     ///
     /// Queries: `{base}/ip/{ip}`
     pub async fn lookup_ip(&self, ip: IpAddr) -> Result<RdapResult> {
@@ -152,12 +155,14 @@ impl RdapClient {
 
         let json: Value = resp.json().await.context("Failed to decode RDAP JSON")?;
         let organization = extract_org(&json);
+        let country_code = extract_country_code(&json);
         let cidrs = extract_cidrs(&json);
         let range = extract_range(&json);
         let as_number = extract_as_number(&json);
 
         Ok(RdapResult {
             organization,
+            country_code,
             cidrs,
             range,
             as_number,
@@ -388,6 +393,65 @@ fn extract_vcard_name_or_org(ent: &Value) -> Option<String> {
     fn_name.or(org_name)
 }
 
+/// Extract a best-effort country code from RDAP response fields.
+///
+/// Returns only ISO-like 2-letter alphabetic codes in uppercase.
+fn extract_country_code(root: &Value) -> Option<String> {
+    root.get("country")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_country_code)
+        .or_else(|| {
+            root.get("countryCode")
+                .and_then(|v| v.as_str())
+                .and_then(normalize_country_code)
+        })
+        .or_else(|| {
+            root.get("entities")
+                .and_then(|v| v.as_array())
+                .and_then(|entities| {
+                    entities.iter().find_map(|ent| {
+                        ent.get("country")
+                            .and_then(|v| v.as_str())
+                            .and_then(normalize_country_code)
+                            .or_else(|| extract_country_code_from_vcard(ent))
+                    })
+                })
+        })
+}
+
+fn extract_country_code_from_vcard(ent: &Value) -> Option<String> {
+    let vcard = ent.get("vcardArray")?.as_array()?;
+    let items = vcard.get(1)?.as_array()?;
+
+    for item in items {
+        let field = item.get(0).and_then(|v| v.as_str())?;
+        if field != "adr" {
+            continue;
+        }
+
+        // Typical vCard address: ["adr", {...}, "text", [po, ext, street, locality, region, postal, country]]
+        if let Some(country) = item
+            .get(3)
+            .and_then(|v| v.as_array())
+            .and_then(|addr| addr.get(6))
+            .and_then(|v| v.as_str())
+            .and_then(normalize_country_code)
+        {
+            return Some(country);
+        }
+    }
+
+    None
+}
+
+fn normalize_country_code(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(trimmed.to_ascii_uppercase())
+}
+
 /// Extract CIDRs using the "cidr0_cidrs" extension if present.
 /// Commonly used by ARIN/RIPE for precise coverage.
 fn extract_cidrs(root: &Value) -> Vec<String> {
@@ -539,6 +603,64 @@ mod tests {
         });
 
         assert_eq!(extract_org(&json), Some("ORG-HANDLE".to_string()));
+    }
+
+    #[test]
+    fn test_extract_country_code_from_primary_country_field() {
+        let json = json!({
+            "country": "us"
+        });
+
+        assert_eq!(extract_country_code(&json), Some("US".to_string()));
+    }
+
+    #[test]
+    fn test_extract_country_code_falls_back_to_country_code_field() {
+        let json = json!({
+            "countryCode": "de"
+        });
+
+        assert_eq!(extract_country_code(&json), Some("DE".to_string()));
+    }
+
+    #[test]
+    fn test_extract_country_code_falls_back_to_entity_country() {
+        let json = json!({
+            "entities": [
+                {
+                    "handle": "EXAMPLE",
+                    "country": "fr"
+                }
+            ]
+        });
+
+        assert_eq!(extract_country_code(&json), Some("FR".to_string()));
+    }
+
+    #[test]
+    fn test_extract_country_code_from_vcard_adr_country() {
+        let json = json!({
+            "entities": [
+                {
+                    "vcardArray": ["vcard", [
+                        ["adr", {}, "text", ["", "", "", "", "", "", "ca"]]
+                    ]]
+                }
+            ]
+        });
+
+        assert_eq!(extract_country_code(&json), Some("CA".to_string()));
+    }
+
+    #[test]
+    fn test_extract_country_code_rejects_invalid_values() {
+        let too_long = json!({ "country": "USA" });
+        let numeric = json!({ "country": "1A" });
+        let empty = json!({ "country": "" });
+
+        assert_eq!(extract_country_code(&too_long), None);
+        assert_eq!(extract_country_code(&numeric), None);
+        assert_eq!(extract_country_code(&empty), None);
     }
 
     #[test]
