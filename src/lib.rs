@@ -8,6 +8,14 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Install ring as the rustls process-global crypto provider.
+///
+/// Returns `Ok(())` the first time, and silently ignores the error on
+/// subsequent calls (rustls returns `Err` if a provider is already installed).
+fn install_ring_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Well-known RDAP registries (RIRs + IANA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RdapRegistry {
@@ -29,15 +37,14 @@ impl FromStr for RdapRegistry {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "ripe" => Ok(Self::RIPE),
-            "arin" => Ok(Self::ARIN),
-            "apnic" => Ok(Self::APNIC),
-            "lacnic" => Ok(Self::LACNIC),
-            "afrinic" => Ok(Self::AFRINIC),
-            "iana" => Ok(Self::IANA),
-            _ => Err(anyhow!("Unknown registry: {}", s)),
-        }
+        // eq_ignore_ascii_case avoids allocating a lowercase String for comparison.
+        if s.eq_ignore_ascii_case("ripe")    { return Ok(Self::RIPE); }
+        if s.eq_ignore_ascii_case("arin")    { return Ok(Self::ARIN); }
+        if s.eq_ignore_ascii_case("apnic")   { return Ok(Self::APNIC); }
+        if s.eq_ignore_ascii_case("lacnic")  { return Ok(Self::LACNIC); }
+        if s.eq_ignore_ascii_case("afrinic") { return Ok(Self::AFRINIC); }
+        if s.eq_ignore_ascii_case("iana")    { return Ok(Self::IANA); }
+        Err(anyhow!("Unknown registry: {}", s))
     }
 }
 
@@ -123,6 +130,8 @@ impl RdapClient {
 
     /// Construct a client for a custom server URL (e.g., internal mirror).
     pub fn for_custom(base_url: &str, timeout: Duration) -> Result<Self> {
+        // Install the ring crypto provider (idempotent — safe to call repeatedly).
+        install_ring_provider();
         let base = trim_trailing_slash(base_url).to_string();
         let http = reqwest::Client::builder()
             .user_agent("rdap-client/0.1 (Rust)")
@@ -285,18 +294,17 @@ fn parse_as_number(s: &str) -> Option<u32> {
 
 /// Extract AS number from text descriptions
 fn extract_as_from_text(text: &str) -> Option<u32> {
-    use std::str::FromStr;
-
     // Look for patterns like "AS15169", "originated by AS15169", etc.
     for word in text.split_whitespace() {
         if let Some(stripped) = word.strip_prefix("AS") {
-            // Remove any trailing punctuation
-            let cleaned = stripped
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>();
-            if let Ok(as_num) = u32::from_str(&cleaned) {
-                return Some(as_num);
+            // Slice the original &str up to the first non-digit — no allocation.
+            let end = stripped
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(stripped.len());
+            if end > 0 {
+                if let Ok(as_num) = stripped[..end].parse::<u32>() {
+                    return Some(as_num);
+                }
             }
         }
     }
@@ -323,29 +331,27 @@ fn extract_org(root: &Value) -> Option<String> {
     let mut candidates: Vec<(usize, String)> = Vec::new();
 
     for ent in entities {
-        let roles = ent
+        // Compute the best role rank without allocating a Vec<String>.
+        // Iterates the JSON array directly, comparing case-insensitively in place.
+        let rank = ent
             .get("roles")
             .and_then(|r| r.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
-                    .collect::<Vec<_>>()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|role| {
+                        role_rank
+                            .iter()
+                            .position(|&wanted| wanted.eq_ignore_ascii_case(role))
+                    })
+                    .min()
+                    .unwrap_or(role_rank.len())
             })
-            .unwrap_or_default();
+            .unwrap_or(role_rank.len());
 
         if let Some(org_str) = extract_vcard_name_or_org(ent) {
-            let rank = roles
-                .iter()
-                .filter_map(|r| role_rank.iter().position(|&wanted| wanted == r))
-                .min()
-                .unwrap_or(role_rank.len());
             candidates.push((rank, org_str));
         } else if let Some(handle) = ent.get("handle").and_then(|h| h.as_str()) {
-            let rank = roles
-                .iter()
-                .filter_map(|r| role_rank.iter().position(|&wanted| wanted == r))
-                .min()
-                .unwrap_or(role_rank.len());
             candidates.push((rank, handle.to_string()));
         }
     }

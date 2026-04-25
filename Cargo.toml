@@ -17,10 +17,17 @@ clap = { version = "4.6", default-features = false, features = [
 # default-features = false drops: charset (encoding_rs), http2 (h2), cookies,
 # multipart, brotli, deflate, gzip, macos-system-certificate-store, socks
 # RDAP returns small UTF-8 JSON over HTTPS – none of those are needed.
+#
+# rustls-no-provider: lets us pick ring instead of the default aws-lc-rs/aws-lc-sys
+# (aws-lc-sys is a ~1.2MiB C library; ring is ~200KB pure Rust).
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
-    "rustls",
+    "rustls-no-provider",
 ] }
+# ring: lightweight Rust TLS crypto backend, replaces aws-lc-rs.
+# We install it as the global rustls provider inside RdapClient::for_custom().
+# tls12: keep TLS 1.2 support — some RDAP servers are still on it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # tokio is ONLY needed by the binary (main.rs) for #[tokio::main].
