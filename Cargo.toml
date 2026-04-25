@@ -5,20 +5,39 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.6", features = ["derive"] }
-reqwest = { version = "0.13", features = [
-    "brotli",
-    "deflate",
-    "gzip",
+# default-features = false drops: color (anstream/anstyle), auto-update, wrap-help
+clap = { version = "4.6", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+    "derive",
+] }
+# default-features = false drops: charset (encoding_rs), http2 (h2), cookies,
+# multipart, brotli, deflate, gzip, macos-system-certificate-store, socks
+# RDAP returns small UTF-8 JSON over HTTPS – none of those are needed.
+reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
+# tokio is ONLY needed by the binary (main.rs) for #[tokio::main].
+# lib.rs has no direct tokio dependency — it exposes plain async fns that are
+# runtime-agnostic. Downstream library consumers bring their own runtime and
+# can freely choose any flavor, e.g.:
+#   tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# and use #[tokio::main] (multi_thread is the default flavor).
+# RdapClient is Send + Sync so it works across thread-pool tasks too.
+tokio = { version = "1.52", default-features = false, features = [
+    "rt",     # current_thread — enough for a sequential CLI
+    "macros", # #[tokio::main(flavor = "current_thread")]
+] }
 
 [profile.release]
 lto = true
 strip = true
-opt-level = 3
+opt-level = "z"        # optimize for size (network latency dominates anyway)
 panic = "abort"
+codegen-units = 1      # allows better cross-crate inlining / dead-code elim
