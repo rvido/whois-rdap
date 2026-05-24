@@ -195,7 +195,9 @@ fn extract_as_number(root: &Value) -> Option<u32> {
         .and_then(|v| v.as_array())
     {
         for autnum in origin_autnums {
-            if let Some(as_num) = autnum.as_u64() {
+            let parsed_num = autnum.as_u64()
+                .or_else(|| autnum.as_str().and_then(|s| s.parse::<u64>().ok()));
+            if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
             }
         }
@@ -204,7 +206,9 @@ fn extract_as_number(root: &Value) -> Option<u32> {
     // Check for cidr0_cidrs with AS number information
     if let Some(cidrs) = root.get("cidr0_cidrs").and_then(|v| v.as_array()) {
         for cidr in cidrs {
-            if let Some(as_num) = cidr.get("autnum").and_then(|h| h.as_u64()) {
+            let parsed_num = cidr.get("autnum")
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())));
+            if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
             }
         }
@@ -213,13 +217,16 @@ fn extract_as_number(root: &Value) -> Option<u32> {
     // First check if there's an "autnums" field directly
     if let Some(autnums) = root.get("autnums").and_then(|v| v.as_array()) {
         for autnum in autnums {
-            if let Some(as_num) = autnum.get("handle").and_then(|h| h.as_str()) {
-                if let Some(parsed) = parse_as_number(as_num) {
-                    return Some(parsed);
-                }
+            if let Some(parsed) = autnum.get("handle")
+                .and_then(|h| h.as_str())
+                .and_then(parse_as_number)
+            {
+                return Some(parsed);
             }
             // Also check the startAutnum field which contains the actual AS number
-            if let Some(as_num) = autnum.get("startAutnum").and_then(|h| h.as_u64()) {
+            let parsed_num = autnum.get("startAutnum")
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())));
+            if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
             }
         }
@@ -229,21 +236,25 @@ fn extract_as_number(root: &Value) -> Option<u32> {
     if let Some(entities) = root.get("entities").and_then(|v| v.as_array()) {
         for entity in entities {
             // Check handle field for AS numbers (format like "AS1234")
-            if let Some(handle) = entity.get("handle").and_then(|h| h.as_str()) {
-                if let Some(parsed) = parse_as_number(handle) {
-                    return Some(parsed);
-                }
+            if let Some(parsed) = entity.get("handle")
+                .and_then(|h| h.as_str())
+                .and_then(parse_as_number)
+            {
+                return Some(parsed);
             }
 
             // Check if entity has autnums
             if let Some(autnums) = entity.get("autnums").and_then(|v| v.as_array()) {
                 for autnum in autnums {
-                    if let Some(as_num) = autnum.get("handle").and_then(|h| h.as_str()) {
-                        if let Some(parsed) = parse_as_number(as_num) {
-                            return Some(parsed);
-                        }
+                    if let Some(parsed) = autnum.get("handle")
+                        .and_then(|h| h.as_str())
+                        .and_then(parse_as_number)
+                    {
+                        return Some(parsed);
                     }
-                    if let Some(as_num) = autnum.get("startAutnum").and_then(|h| h.as_u64()) {
+                    let parsed_num = autnum.get("startAutnum")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())));
+                    if let Some(as_num) = parsed_num {
                         return Some(as_num as u32);
                     }
                 }
@@ -252,10 +263,11 @@ fn extract_as_number(root: &Value) -> Option<u32> {
             // Recursively check nested entities
             if let Some(nested_entities) = entity.get("entities").and_then(|v| v.as_array()) {
                 for nested_entity in nested_entities {
-                    if let Some(handle) = nested_entity.get("handle").and_then(|h| h.as_str()) {
-                        if let Some(parsed) = parse_as_number(handle) {
-                            return Some(parsed);
-                        }
+                    if let Some(parsed) = nested_entity.get("handle")
+                        .and_then(|h| h.as_str())
+                        .and_then(parse_as_number)
+                    {
+                        return Some(parsed);
                     }
                 }
             }
@@ -301,10 +313,8 @@ fn extract_as_from_text(text: &str) -> Option<u32> {
             let end = stripped
                 .find(|c: char| !c.is_ascii_digit())
                 .unwrap_or(stripped.len());
-            if end > 0 {
-                if let Ok(as_num) = stripped[..end].parse::<u32>() {
-                    return Some(as_num);
-                }
+            if let Some(as_num) = stripped.get(..end).and_then(|s| s.parse::<u32>().ok()) {
+                return Some(as_num);
             }
         }
     }
@@ -313,55 +323,61 @@ fn extract_as_from_text(text: &str) -> Option<u32> {
 }
 
 /// Prefer entities with roles like "registrant", "org", "administrative".
+/// Falls back to the top-level "name" field if no organization is found in entities.
 fn extract_org(root: &Value) -> Option<String> {
-    let entities = root.get("entities")?.as_array()?;
-
-    // Role preference order (most relevant first)
-    let role_rank = [
-        "registrant",
-        "org",
-        "administrative",
-        "owner",
-        "technical",
-        "abuse",
-        "sponsoring registrar",
-    ];
-
-    // Build candidates with rank and org value
     let mut candidates: Vec<(usize, String)> = Vec::new();
 
-    for ent in entities {
-        // Compute the best role rank without allocating a Vec<String>.
-        // Iterates the JSON array directly, comparing case-insensitively in place.
-        let rank = ent
-            .get("roles")
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|role| {
-                        role_rank
-                            .iter()
-                            .position(|&wanted| wanted.eq_ignore_ascii_case(role))
-                    })
-                    .min()
-                    .unwrap_or(role_rank.len())
-            })
-            .unwrap_or(role_rank.len());
+    if let Some(entities) = root.get("entities").and_then(|v| v.as_array()) {
+        // Role preference order (most relevant first)
+        let role_rank = [
+            "registrant",
+            "org",
+            "administrative",
+            "owner",
+            "technical",
+            "abuse",
+            "sponsoring registrar",
+        ];
 
-        if let Some(org_str) = extract_vcard_name_or_org(ent) {
-            candidates.push((rank, org_str));
-        } else if let Some(handle) = ent.get("handle").and_then(|h| h.as_str()) {
-            candidates.push((rank, handle.to_string()));
+        for ent in entities {
+            // Compute the best role rank without allocating a Vec<String>.
+            // Iterates the JSON array directly, comparing case-insensitively in place.
+            let rank = ent
+                .get("roles")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .filter_map(|role| {
+                            role_rank
+                                .iter()
+                                .position(|&wanted| wanted.eq_ignore_ascii_case(role))
+                        })
+                        .min()
+                        .unwrap_or(role_rank.len())
+                })
+                .unwrap_or(role_rank.len());
+
+            if let Some(org_str) = extract_vcard_name_or_org(ent) {
+                candidates.push((rank, org_str));
+            } else if let Some(handle) = ent.get("handle").and_then(|h| h.as_str()) {
+                candidates.push((rank, handle.to_string()));
+            }
         }
     }
 
     // Pick the best-ranked
     candidates.sort_by_key(|(rank, _)| *rank);
-    candidates
+    if let Some(org) = candidates
         .into_iter()
         .map(|(_, s)| s)
         .find(|s| !s.is_empty())
+    {
+        return Some(org);
+    }
+
+    // Fallback to top-level "name" field
+    root.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
 /// Extract a human-friendly name from vCard (prefer "fn", then "org")
@@ -467,25 +483,28 @@ fn extract_cidrs(root: &Value) -> Vec<String> {
         for cidr in arr {
             // Two forms observed: { "v4prefix": "192.0.2.0", "length": 24 }
             // or { "v6prefix": "2001:db8::", "length": 32 }
-            if let Some(prefix) = cidr.get("v4prefix").and_then(|v| v.as_str()) {
-                if let Some(len) = cidr.get("length").and_then(|v| v.as_u64()) {
-                    out.push(format!("{}/{}", prefix, len));
-                }
-            } else if let Some(prefix) = cidr.get("v6prefix").and_then(|v| v.as_str()) {
-                if let Some(len) = cidr.get("length").and_then(|v| v.as_u64()) {
-                    out.push(format!("{}/{}", prefix, len));
-                }
+            if let Some((prefix, len)) = cidr.get("v4prefix")
+                .and_then(|v| v.as_str())
+                .zip(cidr.get("length").and_then(|v| v.as_u64()))
+            {
+                out.push(format!("{}/{}", prefix, len));
+            } else if let Some((prefix, len)) = cidr.get("v6prefix")
+                .and_then(|v| v.as_str())
+                .zip(cidr.get("length").and_then(|v| v.as_u64()))
+            {
+                out.push(format!("{}/{}", prefix, len));
             }
         }
     }
 
     // Fallback: sometimes "handle" looks like a CIDR (rare)
-    if out.is_empty() {
-        if let Some(handle) = root.get("handle").and_then(|h| h.as_str()) {
-            if looks_like_cidr(handle) {
-                out.push(handle.to_string());
-            }
-        }
+    if let Some(handle) = out.is_empty()
+        .then(|| root.get("handle"))
+        .flatten()
+        .and_then(|h| h.as_str())
+        .filter(|h| looks_like_cidr(h))
+    {
+        out.push(handle.to_string());
     }
 
     out
@@ -556,23 +575,45 @@ mod tests {
         });
         assert_eq!(extract_as_number(&json), Some(15169));
 
+        // Test with arin_originas0_originautnums as a string-wrapped array
+        let json_str = json!({
+            "arin_originas0_originautnums": ["15169"]
+        });
+        assert_eq!(extract_as_number(&json_str), Some(15169));
+
+        // Test with startAutnum as an integer
+        let json_num = json!({
+            "autnums": [{
+                "startAutnum": 15169
+            }]
+        });
+        assert_eq!(extract_as_number(&json_num), Some(15169));
+
+        // Test with startAutnum as a string
+        let json_str_autnum = json!({
+            "autnums": [{
+                "startAutnum": "15169"
+            }]
+        });
+        assert_eq!(extract_as_number(&json_str_autnum), Some(15169));
+
         // Test with entity handle
-        let json = json!({
+        let json_handle = json!({
             "entities": [{
                 "handle": "AS15169",
                 "roles": ["registrant"]
             }]
         });
-        assert_eq!(extract_as_number(&json), Some(15169));
+        assert_eq!(extract_as_number(&json_handle), Some(15169));
 
         // Test with no AS number
-        let json = json!({
+        let json_none = json!({
             "entities": [{
                 "handle": "GOOGLE",
                 "roles": ["registrant"]
             }]
         });
-        assert_eq!(extract_as_number(&json), None);
+        assert_eq!(extract_as_number(&json_none), None);
     }
 
     #[test]
@@ -609,6 +650,15 @@ mod tests {
         });
 
         assert_eq!(extract_org(&json), Some("ORG-HANDLE".to_string()));
+    }
+
+    #[test]
+    fn test_extract_org_falls_back_to_toplevel_name() {
+        let json = json!({
+            "name": "TEST-NET"
+        });
+
+        assert_eq!(extract_org(&json), Some("TEST-NET".to_string()));
     }
 
     #[test]

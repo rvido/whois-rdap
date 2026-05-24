@@ -3,7 +3,7 @@
 
 use anyhow::{Result, anyhow};
 use clap::{ArgGroup, Parser, ValueHint};
-use serde_json::{Map, Value};
+
 use std::net::IpAddr;
 use std::time::Duration;
 use whois_rdap::{RdapClient, RdapRegistry};
@@ -76,40 +76,17 @@ async fn main() -> Result<()> {
     match client.lookup_ip(ip).await {
         Ok(res) => {
             if args.json {
-                let mut out = Map::new();
-                out.insert("ip".to_string(), Value::String(ip.to_string()));
-                out.insert("rdap_server".to_string(), Value::String(base_url));
-                out.insert(
-                    "organization".to_string(),
-                    Value::String(res.organization.unwrap_or_else(|| "Unknown".to_string())),
-                );
-
-                if let Some(country_code) = res.country_code {
-                    out.insert("country_code".to_string(), Value::String(country_code));
-                }
-
-                if let Some(as_num) = res.as_number {
-                    out.insert("as_number".to_string(), Value::String(format!("AS{}", as_num)));
-                }
-
-                if !res.cidrs.is_empty() {
-                    out.insert(
-                        "cidrs".to_string(),
-                        Value::String(res.cidrs.join(", ")),
-                    );
-                }
-
-                if let Some((start, end)) = res.range {
-                    out.insert("range".to_string(), Value::String(format!("{} - {}", start, end)));
-                }
-
-                if !out.contains_key("cidrs") && !out.contains_key("range") {
-                    out.insert(
-                        "cidr_range".to_string(),
-                        Value::String("Not found in RDAP response".to_string()),
-                    );
-                }
-
+                let range = res.range.map(|(start, end)| AddrRange { start, end });
+                let as_number = res.as_number.map(|num| format!("AS{}", num));
+                let out = JsonResponse {
+                    ip: ip.to_string(),
+                    rdap_server: base_url,
+                    organization: res.organization.unwrap_or_else(|| "Unknown".to_string()),
+                    country_code: res.country_code,
+                    as_number,
+                    cidrs: res.cidrs,
+                    range,
+                };
                 println!("{}", serde_json::to_string(&out)?);
             } else {
                 println!("IP: {}", ip);
@@ -169,4 +146,21 @@ fn print_servers() {
     println!();
     println!("Use one with:  rdap-whois --rir <name> <IP>");
     println!("Or provide a custom server with:  rdap-whois --server <URL> <IP>");
+}
+
+#[derive(serde::Serialize)]
+struct JsonResponse {
+    ip: String,
+    rdap_server: String,
+    organization: String,
+    country_code: Option<String>,
+    as_number: Option<String>,
+    cidrs: Vec<String>,
+    range: Option<AddrRange>,
+}
+
+#[derive(serde::Serialize)]
+struct AddrRange {
+    start: String,
+    end: String,
 }
