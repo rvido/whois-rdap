@@ -38,12 +38,24 @@ impl FromStr for RdapRegistry {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // eq_ignore_ascii_case avoids allocating a lowercase String for comparison.
-        if s.eq_ignore_ascii_case("ripe")    { return Ok(Self::RIPE); }
-        if s.eq_ignore_ascii_case("arin")    { return Ok(Self::ARIN); }
-        if s.eq_ignore_ascii_case("apnic")   { return Ok(Self::APNIC); }
-        if s.eq_ignore_ascii_case("lacnic")  { return Ok(Self::LACNIC); }
-        if s.eq_ignore_ascii_case("afrinic") { return Ok(Self::AFRINIC); }
-        if s.eq_ignore_ascii_case("iana")    { return Ok(Self::IANA); }
+        if s.eq_ignore_ascii_case("ripe") {
+            return Ok(Self::RIPE);
+        }
+        if s.eq_ignore_ascii_case("arin") {
+            return Ok(Self::ARIN);
+        }
+        if s.eq_ignore_ascii_case("apnic") {
+            return Ok(Self::APNIC);
+        }
+        if s.eq_ignore_ascii_case("lacnic") {
+            return Ok(Self::LACNIC);
+        }
+        if s.eq_ignore_ascii_case("afrinic") {
+            return Ok(Self::AFRINIC);
+        }
+        if s.eq_ignore_ascii_case("iana") {
+            return Ok(Self::IANA);
+        }
         Err(anyhow!("Unknown registry: {}", s))
     }
 }
@@ -195,7 +207,8 @@ fn extract_as_number(root: &Value) -> Option<u32> {
         .and_then(|v| v.as_array())
     {
         for autnum in origin_autnums {
-            let parsed_num = autnum.as_u64()
+            let parsed_num = autnum
+                .as_u64()
                 .or_else(|| autnum.as_str().and_then(|s| s.parse::<u64>().ok()));
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
@@ -206,8 +219,10 @@ fn extract_as_number(root: &Value) -> Option<u32> {
     // Check for cidr0_cidrs with AS number information
     if let Some(cidrs) = root.get("cidr0_cidrs").and_then(|v| v.as_array()) {
         for cidr in cidrs {
-            let parsed_num = cidr.get("autnum")
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())));
+            let parsed_num = cidr.get("autnum").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            });
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
             }
@@ -217,15 +232,18 @@ fn extract_as_number(root: &Value) -> Option<u32> {
     // First check if there's an "autnums" field directly
     if let Some(autnums) = root.get("autnums").and_then(|v| v.as_array()) {
         for autnum in autnums {
-            if let Some(parsed) = autnum.get("handle")
+            if let Some(parsed) = autnum
+                .get("handle")
                 .and_then(|h| h.as_str())
                 .and_then(parse_as_number)
             {
                 return Some(parsed);
             }
             // Also check the startAutnum field which contains the actual AS number
-            let parsed_num = autnum.get("startAutnum")
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())));
+            let parsed_num = autnum.get("startAutnum").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            });
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
             }
@@ -236,7 +254,8 @@ fn extract_as_number(root: &Value) -> Option<u32> {
     if let Some(entities) = root.get("entities").and_then(|v| v.as_array()) {
         for entity in entities {
             // Check handle field for AS numbers (format like "AS1234")
-            if let Some(parsed) = entity.get("handle")
+            if let Some(parsed) = entity
+                .get("handle")
                 .and_then(|h| h.as_str())
                 .and_then(parse_as_number)
             {
@@ -246,14 +265,17 @@ fn extract_as_number(root: &Value) -> Option<u32> {
             // Check if entity has autnums
             if let Some(autnums) = entity.get("autnums").and_then(|v| v.as_array()) {
                 for autnum in autnums {
-                    if let Some(parsed) = autnum.get("handle")
+                    if let Some(parsed) = autnum
+                        .get("handle")
                         .and_then(|h| h.as_str())
                         .and_then(parse_as_number)
                     {
                         return Some(parsed);
                     }
-                    let parsed_num = autnum.get("startAutnum")
-                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())));
+                    let parsed_num = autnum.get("startAutnum").and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    });
                     if let Some(as_num) = parsed_num {
                         return Some(as_num as u32);
                     }
@@ -263,7 +285,8 @@ fn extract_as_number(root: &Value) -> Option<u32> {
             // Recursively check nested entities
             if let Some(nested_entities) = entity.get("entities").and_then(|v| v.as_array()) {
                 for nested_entity in nested_entities {
-                    if let Some(parsed) = nested_entity.get("handle")
+                    if let Some(parsed) = nested_entity
+                        .get("handle")
                         .and_then(|h| h.as_str())
                         .and_then(parse_as_number)
                     {
@@ -377,7 +400,9 @@ fn extract_org(root: &Value) -> Option<String> {
     }
 
     // Fallback to top-level "name" field
-    root.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+    root.get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract a human-friendly name from vCard (prefer "fn", then "org")
@@ -483,12 +508,14 @@ fn extract_cidrs(root: &Value) -> Vec<String> {
         for cidr in arr {
             // Two forms observed: { "v4prefix": "192.0.2.0", "length": 24 }
             // or { "v6prefix": "2001:db8::", "length": 32 }
-            if let Some((prefix, len)) = cidr.get("v4prefix")
+            if let Some((prefix, len)) = cidr
+                .get("v4prefix")
                 .and_then(|v| v.as_str())
                 .zip(cidr.get("length").and_then(|v| v.as_u64()))
             {
                 out.push(format!("{}/{}", prefix, len));
-            } else if let Some((prefix, len)) = cidr.get("v6prefix")
+            } else if let Some((prefix, len)) = cidr
+                .get("v6prefix")
                 .and_then(|v| v.as_str())
                 .zip(cidr.get("length").and_then(|v| v.as_u64()))
             {
@@ -498,7 +525,8 @@ fn extract_cidrs(root: &Value) -> Vec<String> {
     }
 
     // Fallback: sometimes "handle" looks like a CIDR (rare)
-    if let Some(handle) = out.is_empty()
+    if let Some(handle) = out
+        .is_empty()
         .then(|| root.get("handle"))
         .flatten()
         .and_then(|h| h.as_str())
@@ -543,8 +571,14 @@ mod tests {
 
     #[test]
     fn test_trim_trailing_slash() {
-        assert_eq!(trim_trailing_slash("https://example.test/"), "https://example.test");
-        assert_eq!(trim_trailing_slash("https://example.test"), "https://example.test");
+        assert_eq!(
+            trim_trailing_slash("https://example.test/"),
+            "https://example.test"
+        );
+        assert_eq!(
+            trim_trailing_slash("https://example.test"),
+            "https://example.test"
+        );
     }
 
     #[test]
@@ -731,7 +765,10 @@ mod tests {
         });
 
         assert_eq!(extract_cidrs(&json), vec!["192.0.2.0/24", "2001:db8::/32"]);
-        assert_eq!(extract_range(&json), Some(("192.0.2.0".to_string(), "192.0.2.255".to_string())));
+        assert_eq!(
+            extract_range(&json),
+            Some(("192.0.2.0".to_string(), "192.0.2.255".to_string()))
+        );
     }
 
     #[test]
