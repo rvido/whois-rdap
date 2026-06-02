@@ -207,9 +207,11 @@ fn extract_as_number(root: &Value) -> Option<u32> {
         .and_then(|v| v.as_array())
     {
         for autnum in origin_autnums {
-            let parsed_num = autnum
-                .as_u64()
-                .or_else(|| autnum.as_str().and_then(|s| parse_as_number(s).map(|n| n as u64)));
+            let parsed_num = autnum.as_u64().or_else(|| {
+                autnum
+                    .as_str()
+                    .and_then(|s| parse_as_number(s).map(|n| n as u64))
+            });
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
             }
@@ -220,8 +222,10 @@ fn extract_as_number(root: &Value) -> Option<u32> {
     if let Some(cidrs) = root.get("cidr0_cidrs").and_then(|v| v.as_array()) {
         for cidr in cidrs {
             let parsed_num = cidr.get("autnum").and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| parse_as_number(s).map(|n| n as u64)))
+                v.as_u64().or_else(|| {
+                    v.as_str()
+                        .and_then(|s| parse_as_number(s).map(|n| n as u64))
+                })
             });
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
@@ -241,8 +245,10 @@ fn extract_as_number(root: &Value) -> Option<u32> {
             }
             // Also check the startAutnum field which contains the actual AS number
             let parsed_num = autnum.get("startAutnum").and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| parse_as_number(s).map(|n| n as u64)))
+                v.as_u64().or_else(|| {
+                    v.as_str()
+                        .and_then(|s| parse_as_number(s).map(|n| n as u64))
+                })
             });
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
@@ -273,8 +279,10 @@ fn extract_as_number(root: &Value) -> Option<u32> {
                         return Some(parsed);
                     }
                     let parsed_num = autnum.get("startAutnum").and_then(|v| {
-                        v.as_u64()
-                            .or_else(|| v.as_str().and_then(|s| parse_as_number(s).map(|n| n as u64)))
+                        v.as_u64().or_else(|| {
+                            v.as_str()
+                                .and_then(|s| parse_as_number(s).map(|n| n as u64))
+                        })
                     });
                     if let Some(as_num) = parsed_num {
                         return Some(as_num as u32);
@@ -344,7 +352,11 @@ fn extract_as_from_text(text: &str) -> Option<u32> {
         let end = stripped
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(stripped.len());
-        let parsed = if end > 0 { stripped[..end].parse::<u32>().ok() } else { None };
+        let parsed = if end > 0 {
+            stripped[..end].parse::<u32>().ok()
+        } else {
+            None
+        };
         if let Some(as_num) = parsed {
             return Some(as_num);
         }
