@@ -209,7 +209,7 @@ fn extract_as_number(root: &Value) -> Option<u32> {
         for autnum in origin_autnums {
             let parsed_num = autnum
                 .as_u64()
-                .or_else(|| autnum.as_str().and_then(|s| s.parse::<u64>().ok()));
+                .or_else(|| autnum.as_str().and_then(|s| parse_as_number(s).map(|n| n as u64)));
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
             }
@@ -221,7 +221,7 @@ fn extract_as_number(root: &Value) -> Option<u32> {
         for cidr in cidrs {
             let parsed_num = cidr.get("autnum").and_then(|v| {
                 v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    .or_else(|| v.as_str().and_then(|s| parse_as_number(s).map(|n| n as u64)))
             });
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
@@ -242,7 +242,7 @@ fn extract_as_number(root: &Value) -> Option<u32> {
             // Also check the startAutnum field which contains the actual AS number
             let parsed_num = autnum.get("startAutnum").and_then(|v| {
                 v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    .or_else(|| v.as_str().and_then(|s| parse_as_number(s).map(|n| n as u64)))
             });
             if let Some(as_num) = parsed_num {
                 return Some(as_num as u32);
@@ -274,7 +274,7 @@ fn extract_as_number(root: &Value) -> Option<u32> {
                     }
                     let parsed_num = autnum.get("startAutnum").and_then(|v| {
                         v.as_u64()
-                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                            .or_else(|| v.as_str().and_then(|s| parse_as_number(s).map(|n| n as u64)))
                     });
                     if let Some(as_num) = parsed_num {
                         return Some(as_num as u32);
@@ -318,28 +318,37 @@ fn extract_as_number(root: &Value) -> Option<u32> {
 
 /// Parse AS number from strings like "AS1234", "1234", etc.
 fn parse_as_number(s: &str) -> Option<u32> {
-    // Handle "AS1234" format
-    if let Some(stripped) = s.strip_prefix("AS") {
-        return stripped.parse().ok();
-    }
+    let s = s.trim();
+    let digits = if let Some(stripped) = s.strip_prefix("AS") {
+        stripped
+    } else {
+        s
+    };
 
-    // Handle plain number format
-    s.parse().ok()
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+
+    if end == 0 {
+        None
+    } else {
+        digits[..end].parse().ok()
+    }
 }
 
 /// Extract AS number from text descriptions
 fn extract_as_from_text(text: &str) -> Option<u32> {
-    // Look for patterns like "AS15169", "originated by AS15169", etc.
-    for word in text.split_whitespace() {
-        if let Some(stripped) = word.strip_prefix("AS") {
-            // Slice the original &str up to the first non-digit — no allocation.
-            let end = stripped
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(stripped.len());
-            if let Some(as_num) = stripped.get(..end).and_then(|s| s.parse::<u32>().ok()) {
-                return Some(as_num);
-            }
+    let mut rest = text;
+    while let Some(idx) = rest.find("AS") {
+        let stripped = &rest[idx + 2..];
+        let end = stripped
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(stripped.len());
+        let parsed = if end > 0 { stripped[..end].parse::<u32>().ok() } else { None };
+        if let Some(as_num) = parsed {
+            return Some(as_num);
         }
+        rest = stripped;
     }
 
     None
@@ -348,7 +357,7 @@ fn extract_as_from_text(text: &str) -> Option<u32> {
 /// Prefer entities with roles like "registrant", "org", "administrative".
 /// Falls back to the top-level "name" field if no organization is found in entities.
 fn extract_org(root: &Value) -> Option<String> {
-    let mut candidates: Vec<(usize, String)> = Vec::new();
+    let mut best_candidate: Option<(usize, &str)> = None;
 
     if let Some(entities) = root.get("entities").and_then(|v| v.as_array()) {
         // Role preference order (most relevant first)
@@ -381,22 +390,21 @@ fn extract_org(root: &Value) -> Option<String> {
                 })
                 .unwrap_or(role_rank.len());
 
+            // If we already have a candidate with a better rank (lower index), we can skip checking/updating if rank >= best_rank
+            if best_candidate.is_some_and(|(best_rank, _)| rank >= best_rank) {
+                continue;
+            }
+
             if let Some(org_str) = extract_vcard_name_or_org(ent) {
-                candidates.push((rank, org_str));
+                best_candidate = Some((rank, org_str));
             } else if let Some(handle) = ent.get("handle").and_then(|h| h.as_str()) {
-                candidates.push((rank, handle.to_string()));
+                best_candidate = Some((rank, handle));
             }
         }
     }
 
-    // Pick the best-ranked
-    candidates.sort_by_key(|(rank, _)| *rank);
-    if let Some(org) = candidates
-        .into_iter()
-        .map(|(_, s)| s)
-        .find(|s| !s.is_empty())
-    {
-        return Some(org);
+    if let Some((_, name)) = best_candidate.filter(|(_, n)| !n.is_empty()) {
+        return Some(name.to_string());
     }
 
     // Fallback to top-level "name" field
@@ -406,26 +414,28 @@ fn extract_org(root: &Value) -> Option<String> {
 }
 
 /// Extract a human-friendly name from vCard (prefer "fn", then "org")
-fn extract_vcard_name_or_org(ent: &Value) -> Option<String> {
+fn extract_vcard_name_or_org(ent: &Value) -> Option<&str> {
     let vcard = ent.get("vcardArray")?.as_array()?;
     if vcard.len() < 2 {
         return None;
     }
     let items = vcard.get(1)?.as_array()?;
 
-    let mut fn_name: Option<String> = None;
-    let mut org_name: Option<String> = None;
+    let mut fn_name: Option<&str> = None;
+    let mut org_name: Option<&str> = None;
 
     for item in items {
         // Typical vCard field: ["fn", {}, "text", "Example Org"]
         // OR: ["org", {}, "text", "Example Org"]
-        if let Some(field) = item.get(0).and_then(|v| v.as_str()) {
-            let val = item
-                .get(3)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
+        let item_arr = match item.as_array() {
+            Some(arr) => arr,
+            None => continue,
+        };
+        if item_arr.len() < 4 {
+            continue;
+        }
+        if let Some(field) = item_arr[0].as_str() {
+            let val = item_arr[3].as_str().unwrap_or("").trim();
             if val.is_empty() {
                 continue;
             }
@@ -446,11 +456,11 @@ fn extract_vcard_name_or_org(ent: &Value) -> Option<String> {
 fn extract_country_code(root: &Value) -> Option<String> {
     root.get("country")
         .and_then(|v| v.as_str())
-        .and_then(normalize_country_code)
+        .and_then(validate_country_code)
         .or_else(|| {
             root.get("countryCode")
                 .and_then(|v| v.as_str())
-                .and_then(normalize_country_code)
+                .and_then(validate_country_code)
         })
         .or_else(|| {
             root.get("entities")
@@ -459,30 +469,40 @@ fn extract_country_code(root: &Value) -> Option<String> {
                     entities.iter().find_map(|ent| {
                         ent.get("country")
                             .and_then(|v| v.as_str())
-                            .and_then(normalize_country_code)
+                            .and_then(validate_country_code)
                             .or_else(|| extract_country_code_from_vcard(ent))
                     })
                 })
         })
+        .map(|s| s.to_ascii_uppercase())
 }
 
-fn extract_country_code_from_vcard(ent: &Value) -> Option<String> {
+fn extract_country_code_from_vcard(ent: &Value) -> Option<&str> {
     let vcard = ent.get("vcardArray")?.as_array()?;
     let items = vcard.get(1)?.as_array()?;
 
     for item in items {
-        let field = item.get(0).and_then(|v| v.as_str())?;
+        let item_arr = match item.as_array() {
+            Some(arr) => arr,
+            None => continue,
+        };
+        if item_arr.len() < 4 {
+            continue;
+        }
+        let field = match item_arr[0].as_str() {
+            Some(f) => f,
+            None => continue,
+        };
         if field != "adr" {
             continue;
         }
 
         // Typical vCard address: ["adr", {...}, "text", [po, ext, street, locality, region, postal, country]]
-        if let Some(country) = item
-            .get(3)
-            .and_then(|v| v.as_array())
+        if let Some(country) = item_arr[3]
+            .as_array()
             .and_then(|addr| addr.get(6))
             .and_then(|v| v.as_str())
-            .and_then(normalize_country_code)
+            .and_then(validate_country_code)
         {
             return Some(country);
         }
@@ -491,20 +511,20 @@ fn extract_country_code_from_vcard(ent: &Value) -> Option<String> {
     None
 }
 
-fn normalize_country_code(s: &str) -> Option<String> {
+fn validate_country_code(s: &str) -> Option<&str> {
     let trimmed = s.trim();
-    if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
-        return None;
+    if trimmed.len() == 2 && trimmed.as_bytes().iter().all(|b| b.is_ascii_alphabetic()) {
+        Some(trimmed)
+    } else {
+        None
     }
-    Some(trimmed.to_ascii_uppercase())
 }
 
 /// Extract CIDRs using the "cidr0_cidrs" extension if present.
 /// Commonly used by ARIN/RIPE for precise coverage.
 fn extract_cidrs(root: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-
     if let Some(arr) = root.get("cidr0_cidrs").and_then(|v| v.as_array()) {
+        let mut out = Vec::with_capacity(arr.len());
         for cidr in arr {
             // Two forms observed: { "v4prefix": "192.0.2.0", "length": 24 }
             // or { "v6prefix": "2001:db8::", "length": 32 }
@@ -522,20 +542,16 @@ fn extract_cidrs(root: &Value) -> Vec<String> {
                 out.push(format!("{}/{}", prefix, len));
             }
         }
+        out
+    } else if let Some(handle) = root.get("handle").and_then(|h| h.as_str()) {
+        if looks_like_cidr(handle) {
+            vec![handle.to_string()]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
     }
-
-    // Fallback: sometimes "handle" looks like a CIDR (rare)
-    if let Some(handle) = out
-        .is_empty()
-        .then(|| root.get("handle"))
-        .flatten()
-        .and_then(|h| h.as_str())
-        .filter(|h| looks_like_cidr(h))
-    {
-        out.push(handle.to_string());
-    }
-
-    out
 }
 
 fn looks_like_cidr(s: &str) -> bool {
@@ -586,6 +602,8 @@ mod tests {
         assert_eq!(parse_as_number("AS15169"), Some(15169));
         assert_eq!(parse_as_number("15169"), Some(15169));
         assert_eq!(parse_as_number("AS0"), Some(0));
+        assert_eq!(parse_as_number("AS15169-ARIN"), Some(15169));
+        assert_eq!(parse_as_number("AS15169-RIPE"), Some(15169));
         assert_eq!(parse_as_number("invalid"), None);
         assert_eq!(parse_as_number("AS"), None);
     }
@@ -598,6 +616,8 @@ mod tests {
             Some(12345)
         );
         assert_eq!(extract_as_from_text("AS15169."), Some(15169)); // with punctuation
+        assert_eq!(extract_as_from_text("(AS15169)"), Some(15169)); // with brackets
+        assert_eq!(extract_as_from_text("[AS15169]"), Some(15169)); // with square brackets
         assert_eq!(extract_as_from_text("no AS number here"), None);
     }
 
