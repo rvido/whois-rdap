@@ -74,6 +74,44 @@ rdap-whois [OPTIONS] <IP>
 -   `-h, --help`: Print help information.
 -   `-V, --version`: Print version information.
 
+## Library Usage
+
+`whois-rdap` can also be used as a high-performance, async-native Rust library. The core `RdapClient` is designed for production workloads, implementing zero-allocation parsing passes during JSON traversal and safe internal connection pooling.
+
+Add to your `Cargo.toml`:
+```toml
+[dependencies]
+whois-rdap = { path = "." } # Or version "0.1.1" when published
+tokio = { version = "1", features = ["full"] }
+```
+
+### Programmatic Example
+
+```rust
+use whois_rdap::{RdapClient, RdapRegistry};
+use std::time::Duration;
+use std::net::IpAddr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Construct a client. RdapClient is thread-safe (Send + Sync)
+    // and is designed to be cloned and reused across tasks.
+    let client = RdapClient::for_registry(RdapRegistry::ARIN, Duration::from_secs(10))?;
+
+    let ip: IpAddr = "8.8.8.8".parse()?;
+    let res = client.lookup_ip(ip).await?;
+
+    println!("Organization: {}", res.organization.unwrap_or_default());
+    println!("CIDRs: {:?}", res.cidrs);
+    if let Some((start, end)) = res.range {
+        println!("IP Range: {} - {}", start, end);
+    }
+    
+    Ok(())
+}
+```
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
