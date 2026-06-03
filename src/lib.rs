@@ -131,7 +131,7 @@ pub struct RdapResult {
 #[derive(Clone, Debug)]
 pub struct RdapClient {
     http: reqwest::Client,
-    base: String,
+    base: reqwest::Url,
 }
 
 impl RdapClient {
@@ -144,7 +144,9 @@ impl RdapClient {
     pub fn for_custom(base_url: &str, timeout: Duration) -> Result<Self> {
         // Install the ring crypto provider (idempotent — safe to call repeatedly).
         install_ring_provider();
-        let base = trim_trailing_slash(base_url).to_string();
+        let base_trimmed = trim_trailing_slash(base_url);
+        let base = reqwest::Url::parse(base_trimmed)
+            .map_err(|e| anyhow!("Invalid base URL '{}': {}", base_url, e))?;
         let http = reqwest::Client::builder()
             .user_agent("rdap-client/0.1 (Rust)")
             .timeout(timeout)
@@ -156,10 +158,17 @@ impl RdapClient {
     ///
     /// Queries: `{base}/ip/{ip}`
     pub async fn lookup_ip(&self, ip: IpAddr) -> Result<RdapResult> {
-        let url = format!("{}/ip/{}", self.base, ip);
+        let mut url = self.base.clone();
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("Base URL cannot be a base for path segments: {}", self.base))?;
+            segments.push("ip");
+            segments.push(&ip.to_string());
+        }
         let resp = self
             .http
-            .get(&url)
+            .get(url.clone())
             .send()
             .await
             .with_context(|| format!("Failed to GET {}", url))?;
