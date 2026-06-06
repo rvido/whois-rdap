@@ -75,6 +75,10 @@ async fn main() -> Result<()> {
     // Perform lookup
     match client.lookup_ip(ip).await {
         Ok(res) => {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+
             if args.json {
                 let range = res.range.map(|(start, end)| AddrRange { start, end });
                 let as_number = res.as_number.map(|num| format!("AS{}", num));
@@ -87,31 +91,33 @@ async fn main() -> Result<()> {
                     cidrs: res.cidrs,
                     range,
                 };
-                println!("{}", serde_json::to_string(&out)?);
+                serde_json::to_writer(&mut handle, &out)?;
+                writeln!(handle)?;
             } else {
-                println!("IP: {}", ip);
-                println!("RDAP Server: {}", base_url); // <- print the string, not the client
-                println!(
+                writeln!(handle, "IP: {}", ip)?;
+                writeln!(handle, "RDAP Server: {}", base_url)?;
+                writeln!(
+                    handle,
                     "Organization: {}",
                     res.organization.as_deref().unwrap_or("Unknown")
-                );
+                )?;
 
                 if let Some(country_code) = res.country_code {
-                    println!("Country Code: {}", country_code);
+                    writeln!(handle, "Country Code: {}", country_code)?;
                 }
 
                 if let Some(as_num) = res.as_number {
-                    println!("AS Number: AS{}", as_num);
+                    writeln!(handle, "AS Number: AS{}", as_num)?;
                 }
 
                 if !res.cidrs.is_empty() {
-                    println!("CIDR(s): {}", res.cidrs.join(", "));
+                    writeln!(handle, "CIDR(s): {}", res.cidrs.join(", "))?;
                 }
                 if let Some((ref start, ref end)) = res.range {
-                    println!("Range: {} - {}", start, end);
+                    writeln!(handle, "Range: {} - {}", start, end)?;
                 }
                 if res.cidrs.is_empty() && res.range.is_none() {
-                    println!("CIDR/Range: Not found in RDAP response");
+                    writeln!(handle, "CIDR/Range: Not found in RDAP response")?;
                 }
             }
         }
