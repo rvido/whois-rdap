@@ -90,7 +90,7 @@ whois-rdap [OPTIONS] <QUERY>
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-whois-rdap = { path = "." } # Or version "0.1.3" when published
+whois-rdap = { path = "." } # Or version "0.2.0" when published
 tokio = { version = "1", features = ["full"] }
 ```
 
