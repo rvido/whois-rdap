@@ -127,6 +127,40 @@ pub struct RdapResult {
     pub raw: Value,
 }
 
+/// Result of an RDAP Domain lookup.
+#[derive(Debug, Clone, Serialize)]
+pub struct RdapDomainResult {
+    /// Domain name (e.g., "example.com").
+    pub handle: String,
+    /// Best-effort organization name, if found (e.g. registrant).
+    pub organization: Option<String>,
+    /// Registrar name, if found.
+    pub registrar: Option<String>,
+    /// Country code, if available.
+    pub country_code: Option<String>,
+    /// Name servers associated with the domain.
+    pub nameservers: Vec<String>,
+    /// Domain status values (e.g., "active", "clientHold").
+    pub status: Vec<String>,
+    /// Full raw RDAP JSON.
+    pub raw: Value,
+}
+
+/// Result of an RDAP ASN lookup.
+#[derive(Debug, Clone, Serialize)]
+pub struct RdapAsnResult {
+    /// Autonomous System Number (e.g., 15169).
+    pub asn: u32,
+    /// Best-effort organization name, if found.
+    pub organization: Option<String>,
+    /// Country code, if available.
+    pub country_code: Option<String>,
+    /// Inclusive ASN range (start, end) — usually identical to the queried ASN.
+    pub range: Option<(u32, u32)>,
+    /// Full raw RDAP JSON.
+    pub raw: Value,
+}
+
 /// Reusable RDAP client.
 #[derive(Clone, Debug)]
 pub struct RdapClient {
@@ -199,6 +233,102 @@ impl RdapClient {
             raw: json,
         })
     }
+
+    /// Lookup a Domain and extract registrant + registrar + country + nameservers.
+    ///
+    /// Queries: `{base}/domain/{domain}`
+    pub async fn lookup_domain(&self, domain: &str) -> Result<RdapDomainResult> {
+        let mut url = self.base.clone();
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("Base URL cannot be a base for path segments: {}", self.base))?;
+            segments.push("domain");
+            segments.push(domain);
+        }
+        let resp = self
+            .http
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("Failed to GET {}", url))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "RDAP server returned status {}.\nBody: {}",
+                status,
+                truncate(&body, 2000)
+            ));
+        }
+
+        let json: Value = resp.json().await.context("Failed to decode RDAP JSON")?;
+        let handle = json
+            .get("ldhName")
+            .or_else(|| json.get("handle"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(domain)
+            .to_string();
+        let organization = extract_org(&json);
+        let registrar = extract_registrar(&json);
+        let country_code = extract_country_code(&json);
+        let nameservers = extract_nameservers(&json);
+        let status = extract_status(&json);
+
+        Ok(RdapDomainResult {
+            handle,
+            organization,
+            registrar,
+            country_code,
+            nameservers,
+            status,
+            raw: json,
+        })
+    }
+
+    /// Lookup an Autonomous System Number (ASN) and extract org + country + range.
+    ///
+    /// Queries: `{base}/autnum/{asn}`
+    pub async fn lookup_asn(&self, asn: u32) -> Result<RdapAsnResult> {
+        let mut url = self.base.clone();
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("Base URL cannot be a base for path segments: {}", self.base))?;
+            segments.push("autnum");
+            segments.push(&asn.to_string());
+        }
+        let resp = self
+            .http
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("Failed to GET {}", url))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "RDAP server returned status {}.\nBody: {}",
+                status,
+                truncate(&body, 2000)
+            ));
+        }
+
+        let json: Value = resp.json().await.context("Failed to decode RDAP JSON")?;
+        let organization = extract_org(&json);
+        let country_code = extract_country_code(&json);
+        let range = extract_asn_range(&json);
+
+        Ok(RdapAsnResult {
+            asn,
+            organization,
+            country_code,
+            range,
+            raw: json,
+        })
+    }
 }
 
 /* --------------------------- Helpers & extractors -------------------------- */
@@ -206,6 +336,63 @@ impl RdapClient {
 fn trim_trailing_slash(s: &str) -> &str {
     s.strip_suffix('/').unwrap_or(s)
 }
+
+fn extract_nameservers(root: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = root.get("nameservers").and_then(|v| v.as_array()) {
+        out.reserve(arr.len());
+        for ns in arr {
+            if let Some(name) = ns.get("ldhName").and_then(|v| v.as_str()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn extract_registrar(root: &Value) -> Option<String> {
+    if let Some(entities) = root.get("entities").and_then(|v| v.as_array()) {
+        for ent in entities {
+            let has_registrar_role = ent
+                .get("roles")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .any(|role| role.eq_ignore_ascii_case("registrar"))
+                })
+                .unwrap_or(false);
+            if has_registrar_role {
+                if let Some(org) = extract_vcard_name_or_org(ent) {
+                    return Some(org.to_string());
+                } else if let Some(handle) = ent.get("handle").and_then(|h| h.as_str()) {
+                    return Some(handle.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_status(root: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = root.get("status").and_then(|v| v.as_array()) {
+        out.reserve(arr.len());
+        for s in arr {
+            if let Some(status_str) = s.as_str() {
+                out.push(status_str.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn extract_asn_range(root: &Value) -> Option<(u32, u32)> {
+    let start = root.get("startAutnum").and_then(|v| v.as_u64())? as u32;
+    let end = root.get("endAutnum").and_then(|v| v.as_u64())? as u32;
+    Some((start, end))
+}
+
 
 /// Extract AS number from RDAP response.
 /// Looks for AS numbers in autnums field or entity references.
@@ -819,5 +1006,32 @@ mod tests {
         });
 
         assert_eq!(extract_cidrs(&json), vec!["198.51.100.0/24"]);
+    }
+
+    #[test]
+    fn test_extract_domain_and_asn_helpers() {
+        let json = json!({
+            "nameservers": [
+                {"ldhName": "ns1.example.com"},
+                {"ldhName": "ns2.example.com"}
+            ],
+            "entities": [
+                {
+                    "handle": "REG-123",
+                    "roles": ["registrar"],
+                    "vcardArray": ["vcard", [
+                        ["fn", {}, "text", "Example Registrar"]
+                    ]]
+                }
+            ],
+            "status": ["active", "clientDeleteProhibited"],
+            "startAutnum": 15169,
+            "endAutnum": 15169
+        });
+
+        assert_eq!(extract_nameservers(&json), vec!["ns1.example.com", "ns2.example.com"]);
+        assert_eq!(extract_registrar(&json), Some("Example Registrar".to_string()));
+        assert_eq!(extract_status(&json), vec!["active", "clientDeleteProhibited"]);
+        assert_eq!(extract_asn_range(&json), Some((15169, 15169)));
     }
 }

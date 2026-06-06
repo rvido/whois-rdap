@@ -1,14 +1,18 @@
 # RDAP Whois Client
 
-A simple command-line tool to query RDAP servers for IP address information. This is a Rust-based alternative to the traditional `whois` command, providing more structured information like organization, CIDR, and AS number.
+A simple command-line tool and library to query RDAP servers for IP address, Domain name, and Autonomous System Number (ASN) information. This is a Rust-based alternative to the traditional `whois` command, providing structured information like organization, CIDR, registrar, name servers, and ranges.
 
 ## Features
 
 - Look up IPv4 and IPv6 addresses.
-- Choose from a list of well-known RDAP servers (RIRs).
-- Use a custom RDAP server URL.
+- Look up Domain Names (e.g., `google.com`).
+- Look up Autonomous System Numbers (e.g., `AS15169` or `15169`).
+- Auto-detect query types (IP, Domain, or ASN) based on the query input.
+- Choose from a list of well-known RDAP servers (RIRs/Registries) or use a custom URL.
+- Support dynamic default bootstrap registries (`iana` for domains and ASNs, `ripe` for IPs).
 - Timeout configuration.
 - Lists known RDAP servers.
+- JSON output support.
 
 ## Installation
 
@@ -33,14 +37,24 @@ A simple command-line tool to query RDAP servers for IP address information. Thi
 ## Usage
 
 ```
-rdap-whois [OPTIONS] <IP>
+whois-rdap [OPTIONS] <QUERY>
 ```
 
 ### Examples
 
--   Look up an IP with the default RIR (RIPE):
+-   Look up an IP with the default registry (`RIPE`):
     ```sh
     ./target/release/whois-rdap 8.8.8.8
+    ```
+
+-   Look up an ASN using the dynamic default bootstrap registry (`IANA`):
+    ```sh
+    ./target/release/whois-rdap AS15169
+    ```
+
+-   Look up a domain using a custom registry (e.g., Verisign for `.com` domains):
+    ```sh
+    ./target/release/whois-rdap --server https://rdap.verisign.com/com/v1 google.com
     ```
 
 -   Look up an IP using a specific RIR:
@@ -48,24 +62,19 @@ rdap-whois [OPTIONS] <IP>
     ./target/release/whois-rdap --rir arin 2606:4700:4700::1111
     ```
 
--   Use a custom RDAP server:
-    ```sh
-    ./target/release/whois-rdap --server https://rdap.example.com/rdap 192.0.2.1
-    ```
-
 -   List all known servers:
     ```sh
     ./target/release/whois-rdap --list-servers
     ```
 
--   Print a successful lookup as a compact JSON string:
+-   Print a domain lookup as a compact JSON string:
     ```sh
-    ./target/release/whois-rdap --json 8.8.8.8
+    ./target/release/whois-rdap --server https://rdap.verisign.com/com/v1 --json google.com
     ```
 
 ### Options
 
--   `<IP>`: The IPv4 or IPv6 address to look up.
+-   `<QUERY>`: The IP address, domain name, or AS number to look up.
 -   `--rir <RIR>`: Pick a known RDAP server. (e.g., `ripe`, `arin`, `apnic`, `lacnic`, `afrinic`, `iana`)
 -   `--server <URL>`: Use a custom RDAP server base URL.
 -   `--list-servers`: List all known servers and exit.
@@ -81,7 +90,7 @@ rdap-whois [OPTIONS] <IP>
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-whois-rdap = { path = "." } # Or version "0.1.1" when published
+whois-rdap = { path = "." } # Or version "0.1.3" when published
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -90,22 +99,28 @@ tokio = { version = "1", features = ["full"] }
 ```rust
 use whois_rdap::{RdapClient, RdapRegistry};
 use std::time::Duration;
-use std::net::IpAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Construct a client. RdapClient is thread-safe (Send + Sync)
     // and is designed to be cloned and reused across tasks.
-    let client = RdapClient::for_registry(RdapRegistry::ARIN, Duration::from_secs(10))?;
+    let client = RdapClient::for_registry(RdapRegistry::IANA, Duration::from_secs(10))?;
 
-    let ip: IpAddr = "8.8.8.8".parse()?;
-    let res = client.lookup_ip(ip).await?;
+    // 1. IP Lookup
+    let ip_res = client.lookup_ip("8.8.8.8".parse()?).await?;
+    println!("IP Org: {}", ip_res.organization.unwrap_or_default());
 
-    println!("Organization: {}", res.organization.unwrap_or_default());
-    println!("CIDRs: {:?}", res.cidrs);
-    if let Some((start, end)) = res.range {
-        println!("IP Range: {} - {}", start, end);
-    }
+    // 2. Domain Lookup
+    // Querying .com registry directly (requires registry specific server URL)
+    let domain_client = RdapClient::for_custom("https://rdap.verisign.com/com/v1", Duration::from_secs(5))?;
+    let domain_res = domain_client.lookup_domain("google.com").await?;
+    println!("Domain Registrar: {}", domain_res.registrar.unwrap_or_default());
+    println!("Name Servers: {:?}", domain_res.nameservers);
+
+    // 3. ASN Lookup
+    let asn_client = RdapClient::for_custom("https://rdap.arin.net/bootstrap", Duration::from_secs(5))?;
+    let asn_res = asn_client.lookup_asn(15169).await?;
+    println!("ASN Org: {}", asn_res.organization.unwrap_or_default());
     
     Ok(())
 }
@@ -114,4 +129,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
