@@ -1,6 +1,11 @@
 // Rust RDAP client library to query RDAP servers for IP address information.
 // Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
 
+pub mod bootstrap;
+pub mod bulk;
+pub mod cache;
+pub mod redirect;
+
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::Value;
@@ -186,6 +191,14 @@ impl RdapClient {
             .timeout(timeout)
             .build()?;
         Ok(Self { http, base })
+    }
+
+    /// Return a reference to the underlying HTTP client (for redirect following).
+    ///
+    /// The client is cloneable and reuses the same connection pool — no extra
+    /// TCP connections are created.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
     }
 
     /// Lookup an IP (v4 or v6) and extract org + country + CIDRs + range.
