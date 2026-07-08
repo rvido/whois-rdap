@@ -230,7 +230,8 @@ impl RdapClient {
             ));
         }
 
-        let json: Value = resp.json().await.context("Failed to decode RDAP JSON")?;
+        let bytes = resp.bytes().await.context("Failed to read response bytes")?;
+        let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
         let organization = extract_org(&json);
         let country_code = extract_country_code(&json);
         let cidrs = extract_cidrs(&json);
@@ -276,7 +277,8 @@ impl RdapClient {
             ));
         }
 
-        let json: Value = resp.json().await.context("Failed to decode RDAP JSON")?;
+        let bytes = resp.bytes().await.context("Failed to read response bytes")?;
+        let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
         let handle = json
             .get("ldhName")
             .or_else(|| json.get("handle"))
@@ -329,7 +331,8 @@ impl RdapClient {
             ));
         }
 
-        let json: Value = resp.json().await.context("Failed to decode RDAP JSON")?;
+        let bytes = resp.bytes().await.context("Failed to read response bytes")?;
+        let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
         let organization = extract_org(&json);
         let country_code = extract_country_code(&json);
         let range = extract_asn_range(&json);

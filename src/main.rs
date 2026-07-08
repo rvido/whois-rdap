@@ -139,7 +139,7 @@ fn parse_query_asn(query: &str) -> Result<u32> {
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
 

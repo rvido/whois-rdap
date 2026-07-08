@@ -12,7 +12,7 @@ PREFIX       ?= $(HOME)/.local
 INSTALL_DIR  := $(PREFIX)/bin
 BINARY       := whois-rdap
 CARGO        := cargo
-CARGO_FLAGS  ?=
+SQLITE_FLAGS := "-DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_OMIT_AUTOVACUUM -DSQLITE_OMIT_TRACE -DSQLITE_OMIT_GET_TABLE -DSQLITE_OMIT_TCL_VARIABLE"
 
 # Parallelism for tests (defaults to number of logical CPUs)
 TEST_THREADS ?= $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
@@ -25,14 +25,14 @@ all: release
 
 ## Build an optimised release binary (LTO, stripped, size-optimised)
 release:
-	$(CARGO) build --release $(CARGO_FLAGS)
+	LIBSQLITE3_FLAGS=$(SQLITE_FLAGS) $(CARGO) build --release $(CARGO_FLAGS)
 	@echo ""
 	@echo "  Binary:  target/release/$(BINARY)"
 	@echo "  Size:    $$(du -sh target/release/$(BINARY) | cut -f1)"
 
 ## Build a debug binary (fast compile, debug info included)
 debug:
-	$(CARGO) build $(CARGO_FLAGS)
+	LIBSQLITE3_FLAGS=$(SQLITE_FLAGS) $(CARGO) build $(CARGO_FLAGS)
 	@echo ""
 	@echo "  Binary:  target/debug/$(BINARY)"
 
