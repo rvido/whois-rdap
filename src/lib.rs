@@ -344,6 +344,78 @@ impl RdapClient {
     }
 }
 
+/* -------------------- Public JSON parse helpers -------------------------
+   These let callers (including main.rs and the cache layer) reconstruct a
+   typed result from a raw RDAP JSON Value without going through the network.
+
+   IMPORTANT: `raw` in RdapResult / RdapDomainResult / RdapAsnResult is the
+   *original* RDAP response JSON.  The extracted fields (organization, cidrs,
+   etc.) are NOT stored as top-level keys inside `raw` — they are separate
+   struct fields extracted by the functions below.  Never try to read
+   `raw["organization"]` or similar; always go through these parse functions.
+------------------------------------------------------------------------ */
+
+/// Build an `RdapResult` by running the full extractor suite on a raw RDAP
+/// IP-network JSON response.
+///
+/// Use this when you already have the raw JSON (e.g. from the cache or from
+/// `follow_links`) and need the typed, extracted fields.
+pub fn parse_ip_response(json: Value) -> RdapResult {
+    let organization = extract_org(&json);
+    let country_code = extract_country_code(&json);
+    let cidrs = extract_cidrs(&json);
+    let range = extract_range(&json);
+    let as_number = extract_as_number(&json);
+    RdapResult {
+        organization,
+        country_code,
+        cidrs,
+        range,
+        as_number,
+        raw: json,
+    }
+}
+
+/// Build an `RdapDomainResult` by running the full extractor suite on a raw
+/// RDAP domain JSON response.
+pub fn parse_domain_response(domain: &str, json: Value) -> RdapDomainResult {
+    let handle = json
+        .get("ldhName")
+        .or_else(|| json.get("handle"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(domain)
+        .to_string();
+    let organization = extract_org(&json);
+    let registrar = extract_registrar(&json);
+    let country_code = extract_country_code(&json);
+    let nameservers = extract_nameservers(&json);
+    let status = extract_status(&json);
+    RdapDomainResult {
+        handle,
+        organization,
+        registrar,
+        country_code,
+        nameservers,
+        status,
+        raw: json,
+    }
+}
+
+/// Build an `RdapAsnResult` by running the full extractor suite on a raw
+/// RDAP autnum JSON response.
+pub fn parse_asn_response(asn: u32, json: Value) -> RdapAsnResult {
+    let organization = extract_org(&json);
+    let country_code = extract_country_code(&json);
+    let range = extract_asn_range(&json);
+    RdapAsnResult {
+        asn,
+        organization,
+        country_code,
+        range,
+        raw: json,
+    }
+}
+
 /* --------------------------- Helpers & extractors -------------------------- */
 
 fn trim_trailing_slash(s: &str) -> &str {
@@ -1046,5 +1118,361 @@ mod tests {
         assert_eq!(extract_registrar(&json), Some("Example Registrar".to_string()));
         assert_eq!(extract_status(&json), vec!["active", "clientDeleteProhibited"]);
         assert_eq!(extract_asn_range(&json), Some((15169, 15169)));
+    }
+
+    // ── parse_ip_response tests ───────────────────────────────────────────────
+    //
+    // These guard against the regression where main.rs was calling
+    // `raw.get("organization")` on a raw RDAP JSON Value.  Raw RDAP does NOT
+    // have top-level "organization", "cidrs", or "range_start" keys — those
+    // are extracted by our helpers.  parse_ip_response must always call the
+    // real extractors.
+
+    /// Baseline: raw RDAP JSON never has a top-level "organization" key.
+    /// Confirms the regression is detectable at the unit-test level.
+    #[test]
+    fn test_raw_rdap_has_no_top_level_organization_key() {
+        // Realistic ARIN-format IP response for 20.59.128.25 (abbreviated)
+        let raw = json!({
+            "objectClassName": "ip network",
+            "handle": "NET-20-33-0-0-1",
+            "startAddress": "20.33.0.0",
+            "endAddress": "20.128.255.255",
+            "name": "MSFT",
+            "country": "US",
+            "entities": [
+                {
+                    "objectClassName": "entity",
+                    "handle": "MSFT",
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [
+                        ["version", {}, "text", "4.0"],
+                        ["fn",      {}, "text", "Microsoft Corporation"]
+                    ]]
+                }
+            ]
+        });
+
+        // The raw JSON has no "organization" key — this is the broken path
+        assert!(raw.get("organization").is_none(),
+            "Raw RDAP JSON must NOT contain a top-level 'organization' key");
+        assert!(raw.get("cidrs").is_none(),
+            "Raw RDAP JSON must NOT contain a top-level 'cidrs' key");
+        assert!(raw.get("range_start").is_none(),
+            "Raw RDAP JSON must NOT contain a top-level 'range_start' key");
+    }
+
+    /// parse_ip_response on an ARIN-format response correctly extracts org.
+    #[test]
+    fn test_parse_ip_response_arin_format() {
+        let raw = json!({
+            "objectClassName": "ip network",
+            "handle": "NET-20-33-0-0-1",
+            "startAddress": "20.33.0.0",
+            "endAddress": "20.128.255.255",
+            "country": "US",
+            "cidr0_cidrs": [
+                {"v4prefix": "20.33.0.0",  "length": 16},
+                {"v4prefix": "20.34.0.0",  "length": 15},
+                {"v4prefix": "20.128.0.0", "length": 16}
+            ],
+            "entities": [
+                {
+                    "handle": "MSFT",
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [
+                        ["version", {}, "text", "4.0"],
+                        ["fn",      {}, "text", "Microsoft Corporation"]
+                    ]]
+                }
+            ]
+        });
+
+        let res = parse_ip_response(raw);
+
+        assert_eq!(res.organization.as_deref(), Some("Microsoft Corporation"),
+            "parse_ip_response must extract org from entities[].vcardArray");
+        assert_eq!(res.country_code.as_deref(), Some("US"));
+        assert!(res.cidrs.contains(&"20.33.0.0/16".to_string()),
+            "parse_ip_response must extract cidrs from cidr0_cidrs");
+        assert_eq!(res.range, Some(("20.33.0.0".to_string(), "20.128.255.255".to_string())));
+    }
+
+    /// parse_ip_response on a RIPE-format response (uses top-level "name").
+    #[test]
+    fn test_parse_ip_response_ripe_format() {
+        let raw = json!({
+            "objectClassName": "ip network",
+            "handle": "8.8.8.0 - 8.8.8.255",
+            "startAddress": "8.8.8.0",
+            "endAddress": "8.8.8.255",
+            "name": "GOOGL-IPV4",
+            "country": "US",
+            "cidr0_cidrs": [{"v4prefix": "8.8.8.0", "length": 24}]
+        });
+
+        let res = parse_ip_response(raw);
+        assert_eq!(res.organization.as_deref(), Some("GOOGL-IPV4"),
+            "Falls back to top-level 'name' when no entities with vcard");
+        assert_eq!(res.cidrs, vec!["8.8.8.0/24"]);
+        assert_eq!(res.range, Some(("8.8.8.0".to_string(), "8.8.8.255".to_string())));
+    }
+
+    /// parse_ip_response on a LACNIC-format response.
+    #[test]
+    fn test_parse_ip_response_lacnic_format() {
+        let raw = json!({
+            "objectClassName": "ip network",
+            "handle": "177.20.0.0/14",
+            "startAddress": "177.20.0.0",
+            "endAddress": "177.23.255.255",
+            "country": "BR",
+            "entities": [
+                {
+                    "handle": "BR-NICA1-LACNIC",
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [
+                        ["version", {}, "text", "4.0"],
+                        ["fn",      {}, "text", "Nicbr Núcleo de Informação e Coordenação do Ponto BR"]
+                    ]]
+                }
+            ]
+        });
+
+        let res = parse_ip_response(raw);
+        assert!(res.organization.is_some());
+        assert_eq!(res.country_code.as_deref(), Some("BR"));
+    }
+
+    /// parse_ip_response on a response with only startAddress/endAddress (no cidr0_cidrs)
+    /// falls back to the handle when it looks like a CIDR.
+    #[test]
+    fn test_parse_ip_response_cidr_from_handle() {
+        let raw = json!({
+            "handle": "198.51.100.0/24",
+            "startAddress": "198.51.100.0",
+            "endAddress": "198.51.100.255"
+        });
+
+        let res = parse_ip_response(raw);
+        assert!(res.cidrs.contains(&"198.51.100.0/24".to_string()),
+            "Should fall back to handle as CIDR");
+        assert_eq!(res.range, Some(("198.51.100.0".to_string(), "198.51.100.255".to_string())));
+    }
+
+    /// Critical regression: the result of parse_ip_response must survive a
+    /// cache roundtrip.  When raw JSON is stored and re-loaded from the cache,
+    /// parse_ip_response must still produce correct extracted fields.
+    #[test]
+    fn test_parse_ip_response_survives_cache_roundtrip() {
+        use serde_json::from_slice;
+
+        let raw = json!({
+            "objectClassName": "ip network",
+            "startAddress": "20.33.0.0",
+            "endAddress": "20.128.255.255",
+            "country": "US",
+            "cidr0_cidrs": [{"v4prefix": "20.33.0.0", "length": 16}],
+            "entities": [
+                {
+                    "handle": "MSFT",
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [
+                        ["fn", {}, "text", "Microsoft Corporation"]
+                    ]]
+                }
+            ]
+        });
+
+        // Simulate cache store → load (JSON serialise → deserialise)
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        let reloaded: serde_json::Value = from_slice(&bytes).unwrap();
+
+        let res = parse_ip_response(reloaded);
+        assert_eq!(res.organization.as_deref(), Some("Microsoft Corporation"),
+            "Organization must survive cache roundtrip \
+             (regression: raw RDAP has no top-level 'organization' key)");
+        assert_eq!(res.country_code.as_deref(), Some("US"),
+            "Country code must survive cache roundtrip");
+        assert!(!res.cidrs.is_empty(),
+            "CIDRs must survive cache roundtrip");
+    }
+
+    // ── parse_domain_response tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_domain_response_extracts_handle_from_ldhname() {
+        let raw = json!({
+            "ldhName": "GOOGLE.COM",
+            "entities": [
+                {
+                    "handle": "292",
+                    "roles": ["registrar"],
+                    "vcardArray": ["vcard", [
+                        ["fn", {}, "text", "Google LLC"]
+                    ]]
+                }
+            ],
+            "nameservers": [
+                {"ldhName": "ns1.google.com"},
+                {"ldhName": "ns2.google.com"}
+            ],
+            "status": ["active"]
+        });
+
+        let res = parse_domain_response("google.com", raw);
+        assert_eq!(res.handle, "GOOGLE.COM");
+        assert_eq!(res.registrar.as_deref(), Some("Google LLC"));
+        assert_eq!(res.nameservers, vec!["ns1.google.com", "ns2.google.com"]);
+        assert_eq!(res.status, vec!["active"]);
+    }
+
+    #[test]
+    fn test_parse_domain_response_falls_back_to_handle_field() {
+        let raw = json!({
+            "handle": "EXAMPLE-COM",
+            "status": ["inactive"]
+        });
+
+        let res = parse_domain_response("example.com", raw);
+        assert_eq!(res.handle, "EXAMPLE-COM");
+    }
+
+    #[test]
+    fn test_parse_domain_response_falls_back_to_domain_arg() {
+        let raw = json!({
+            "status": ["active"]
+        });
+
+        let res = parse_domain_response("fallback.com", raw);
+        assert_eq!(res.handle, "fallback.com");
+    }
+
+    /// Cache roundtrip for domain responses.
+    #[test]
+    fn test_parse_domain_response_survives_cache_roundtrip() {
+        let raw = json!({
+            "ldhName": "EXAMPLE.COM",
+            "entities": [
+                {
+                    "roles": ["registrar"],
+                    "vcardArray": ["vcard", [
+                        ["fn", {}, "text", "Example Registrar Inc"]
+                    ]]
+                }
+            ],
+            "nameservers": [{"ldhName": "ns1.example.com"}],
+            "status": ["active"]
+        });
+
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        let reloaded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let res = parse_domain_response("example.com", reloaded);
+        assert_eq!(res.handle, "EXAMPLE.COM");
+        assert_eq!(res.registrar.as_deref(), Some("Example Registrar Inc"),
+            "Registrar must survive cache roundtrip");
+        assert_eq!(res.nameservers, vec!["ns1.example.com"],
+            "Nameservers must survive cache roundtrip");
+        assert_eq!(res.status, vec!["active"],
+            "Status must survive cache roundtrip");
+    }
+
+    // ── parse_asn_response tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_asn_response_extracts_range_and_org() {
+        let raw = json!({
+            "objectClassName": "autnum",
+            "handle": "AS15169",
+            "startAutnum": 15169,
+            "endAutnum": 15169,
+            "name": "GOOGLE",
+            "country": "US",
+            "entities": [
+                {
+                    "handle": "GOGL",
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [
+                        ["fn", {}, "text", "Google LLC"]
+                    ]]
+                }
+            ]
+        });
+
+        let res = parse_asn_response(15169, raw);
+        assert_eq!(res.asn, 15169);
+        assert_eq!(res.organization.as_deref(), Some("Google LLC"));
+        assert_eq!(res.country_code.as_deref(), Some("US"));
+        assert_eq!(res.range, Some((15169, 15169)));
+    }
+
+    #[test]
+    fn test_parse_asn_response_range_spanning_block() {
+        let raw = json!({
+            "startAutnum": 64496,
+            "endAutnum": 64511,
+            "name": "TEST-BLOCK"
+        });
+
+        let res = parse_asn_response(64500, raw);
+        assert_eq!(res.range, Some((64496, 64511)));
+        assert_eq!(res.organization.as_deref(), Some("TEST-BLOCK"));
+    }
+
+    /// Cache roundtrip for ASN responses.
+    #[test]
+    fn test_parse_asn_response_survives_cache_roundtrip() {
+        let raw = json!({
+            "startAutnum": 15169,
+            "endAutnum": 15169,
+            "country": "US",
+            "entities": [
+                {
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [
+                        ["fn", {}, "text", "Google LLC"]
+                    ]]
+                }
+            ]
+        });
+
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        let reloaded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let res = parse_asn_response(15169, reloaded);
+        assert_eq!(res.organization.as_deref(), Some("Google LLC"),
+            "Organization must survive cache roundtrip");
+        assert_eq!(res.range, Some((15169, 15169)),
+            "ASN range must survive cache roundtrip");
+    }
+
+    // ── Regression guard: parse functions vs. raw-key access ─────────────────
+
+    /// Confirm that reading "organization" directly from raw RDAP JSON always
+    /// returns None — which is what the old broken code did, causing the
+    /// 'Unknown' regression.
+    #[test]
+    fn test_regression_reading_fake_keys_from_raw_always_fails() {
+        let arin_response = json!({
+            "startAddress": "20.33.0.0",
+            "endAddress": "20.128.255.255",
+            "entities": [
+                {
+                    "roles": ["registrant"],
+                    "vcardArray": ["vcard", [["fn", {}, "text", "Microsoft Corporation"]]]
+                }
+            ]
+        });
+
+        // Simulate the OLD (broken) approach
+        let org_broken = arin_response.get("organization").and_then(|v| v.as_str());
+        assert!(org_broken.is_none(),
+            "BROKEN approach: reading 'organization' from raw RDAP is always None");
+
+        // Confirm the NEW (correct) approach works
+        let res = parse_ip_response(arin_response);
+        assert_eq!(res.organization.as_deref(), Some("Microsoft Corporation"),
+            "CORRECT approach: parse_ip_response extracts org properly");
     }
 }

@@ -227,19 +227,11 @@ async fn main() -> Result<()> {
             let cache_key = key_ip(&ip);
             let ttl = args.cache_ttl_ip;
 
-            // Cache read
+            // Cache read — the stored blob is raw RDAP JSON, so we must run
+            // the real extractor suite (parse_ip_response) to recover fields.
             if let Some(ref c) = cache {
                 if let Ok(Some(cached)) = c.get(&cache_key) {
-                    let res = whois_rdap::RdapResult {
-                        organization: cached.get("organization").and_then(|v| v.as_str()).map(str::to_owned),
-                        country_code: cached.get("country_code").and_then(|v| v.as_str()).map(str::to_owned),
-                        cidrs: cached.get("cidrs").and_then(|v| v.as_array())
-                            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
-                            .unwrap_or_default(),
-                        range: extract_cached_ip_range(&cached),
-                        as_number: cached.get("as_number").and_then(|v| v.as_u64()).map(|n| n as u32),
-                        raw: cached,
-                    };
+                    let res = whois_rdap::parse_ip_response(cached);
                     print_ip_result(&mut handle, ip, &base_url, &res, args.json)?;
                     return Ok(());
                 }
@@ -247,9 +239,16 @@ async fn main() -> Result<()> {
 
             match client.lookup_ip(ip).await {
                 Ok(res) => {
-                    // Follow RDAP links for richer data
-                    let raw = follow_links(client.http_client(), res.raw, max_redirects).await;
-                    let res = rebuild_ip_result(raw);
+                    // Optionally follow RDAP links for richer data.
+                    // If follow_links returns a different JSON, re-extract.
+                    // If unchanged (no useful link found), keep the already-
+                    // extracted res — do NOT rebuild from raw.
+                    let followed = follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
+                    let res = if followed != res.raw {
+                        whois_rdap::parse_ip_response(followed)
+                    } else {
+                        res
+                    };
 
                     if let Some(ref c) = cache {
                         c.insert_background(cache_key, &res.raw, ttl);
@@ -267,7 +266,7 @@ async fn main() -> Result<()> {
 
             if let Some(ref c) = cache {
                 if let Ok(Some(cached)) = c.get(&cache_key) {
-                    let res = rebuild_domain_result_from_cache(&domain, &cached);
+                    let res = whois_rdap::parse_domain_response(&domain, cached);
                     print_domain_result(&mut handle, &base_url, &res, args.json)?;
                     return Ok(());
                 }
@@ -275,9 +274,9 @@ async fn main() -> Result<()> {
 
             match client.lookup_domain(&domain).await {
                 Ok(res) => {
-                    let raw = follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
-                    let res = if raw.is_object() && raw != res.raw {
-                        rebuild_domain_result_from_full(&domain, raw)
+                    let followed = follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
+                    let res = if followed != res.raw {
+                        whois_rdap::parse_domain_response(&domain, followed)
                     } else {
                         res
                     };
@@ -297,7 +296,7 @@ async fn main() -> Result<()> {
 
             if let Some(ref c) = cache {
                 if let Ok(Some(cached)) = c.get(&cache_key) {
-                    let res = rebuild_asn_result_from_cache(asn, &cached);
+                    let res = whois_rdap::parse_asn_response(asn, cached);
                     print_asn_result(&mut handle, &base_url, &res, args.json)?;
                     return Ok(());
                 }
@@ -367,74 +366,9 @@ fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
         .build()?)
 }
 
-// ── Result rebuilders (from cached raw JSON) ───────────────────────────────
-
-/// Extract a string-pair range used in RdapResult (IP range: "1.2.3.0" - "1.2.3.255").
-fn extract_cached_ip_range(v: &serde_json::Value) -> Option<(String, String)> {
-    let start = v.get("range_start").and_then(|x| x.as_str())?.to_owned();
-    let end = v.get("range_end").and_then(|x| x.as_str())?.to_owned();
-    Some((start, end))
-}
-
-/// Extract a u32-pair range used in RdapAsnResult.
-fn extract_cached_asn_range(v: &serde_json::Value) -> Option<(u32, u32)> {
-    let start = v.get("range_start").and_then(|x| x.as_u64())? as u32;
-    let end = v.get("range_end").and_then(|x| x.as_u64())? as u32;
-    Some((start, end))
-}
-
-fn rebuild_ip_result(raw: serde_json::Value) -> whois_rdap::RdapResult {
-    let organization = raw.get("organization").and_then(|v| v.as_str()).map(str::to_owned);
-    let country_code = raw.get("country_code").and_then(|v| v.as_str()).map(str::to_owned);
-    let cidrs = raw.get("cidrs").and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
-        .unwrap_or_default();
-    let range = extract_cached_ip_range(&raw);
-    let as_number = raw.get("as_number").and_then(|v| v.as_u64()).map(|n| n as u32);
-    whois_rdap::RdapResult { organization, country_code, cidrs, range, as_number, raw }
-}
-
-fn rebuild_domain_result_from_cache(domain: &str, cached: &serde_json::Value) -> whois_rdap::RdapDomainResult {
-    whois_rdap::RdapDomainResult {
-        handle: cached.get("handle").and_then(|v| v.as_str()).unwrap_or(domain).to_owned(),
-        organization: cached.get("organization").and_then(|v| v.as_str()).map(str::to_owned),
-        registrar: cached.get("registrar").and_then(|v| v.as_str()).map(str::to_owned),
-        country_code: cached.get("country_code").and_then(|v| v.as_str()).map(str::to_owned),
-        nameservers: cached.get("nameservers").and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
-            .unwrap_or_default(),
-        status: cached.get("status").and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
-            .unwrap_or_default(),
-        raw: cached.clone(),
-    }
-}
-
-fn rebuild_domain_result_from_full(domain: &str, raw: serde_json::Value) -> whois_rdap::RdapDomainResult {
-    // Re-extract fields from raw RDAP JSON using library extractors via lookup_domain logic.
-    // For simplicity, we defer to creating a minimal struct here; a deeper extraction
-    // would call the library's private helpers — keeping it decoupled.
-    whois_rdap::RdapDomainResult {
-        handle: raw.get("ldhName").or_else(|| raw.get("handle"))
-            .and_then(|v| v.as_str()).unwrap_or(domain).to_owned(),
-        organization: None,
-        registrar: None,
-        country_code: None,
-        nameservers: Vec::new(),
-        status: Vec::new(),
-        raw,
-    }
-}
-
-fn rebuild_asn_result_from_cache(asn: u32, cached: &serde_json::Value) -> whois_rdap::RdapAsnResult {
-    whois_rdap::RdapAsnResult {
-        asn,
-        organization: cached.get("organization").and_then(|v| v.as_str()).map(str::to_owned),
-        country_code: cached.get("country_code").and_then(|v| v.as_str()).map(str::to_owned),
-        range: extract_cached_asn_range(cached),
-        raw: cached.clone(),
-    }
-}
+// (Broken rebuild helpers removed — use whois_rdap::parse_ip_response,
+//  parse_domain_response, and parse_asn_response from lib.rs instead.
+//  Those call the real RDAP extractors rather than reading fake keys.)
 
 // ── Print helpers ──────────────────────────────────────────────────────────
 
