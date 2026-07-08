@@ -207,9 +207,9 @@ impl RdapClient {
     pub async fn lookup_ip(&self, ip: IpAddr) -> Result<RdapResult> {
         let mut url = self.base.clone();
         {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| anyhow!("Base URL cannot be a base for path segments: {}", self.base))?;
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                anyhow!("Base URL cannot be a base for path segments: {}", self.base)
+            })?;
             segments.push("ip");
             segments.push(&ip.to_string());
         }
@@ -253,9 +253,9 @@ impl RdapClient {
     pub async fn lookup_domain(&self, domain: &str) -> Result<RdapDomainResult> {
         let mut url = self.base.clone();
         {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| anyhow!("Base URL cannot be a base for path segments: {}", self.base))?;
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                anyhow!("Base URL cannot be a base for path segments: {}", self.base)
+            })?;
             segments.push("domain");
             segments.push(domain);
         }
@@ -306,9 +306,9 @@ impl RdapClient {
     pub async fn lookup_asn(&self, asn: u32) -> Result<RdapAsnResult> {
         let mut url = self.base.clone();
         {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| anyhow!("Base URL cannot be a base for path segments: {}", self.base))?;
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                anyhow!("Base URL cannot be a base for path segments: {}", self.base)
+            })?;
             segments.push("autnum");
             segments.push(&asn.to_string());
         }
@@ -477,7 +477,6 @@ fn extract_asn_range(root: &Value) -> Option<(u32, u32)> {
     let end = root.get("endAutnum").and_then(|v| v.as_u64())? as u32;
     Some((start, end))
 }
-
 
 /// Extract AS number from RDAP response.
 /// Looks for AS numbers in autnums field or entity references.
@@ -1114,9 +1113,18 @@ mod tests {
             "endAutnum": 15169
         });
 
-        assert_eq!(extract_nameservers(&json), vec!["ns1.example.com", "ns2.example.com"]);
-        assert_eq!(extract_registrar(&json), Some("Example Registrar".to_string()));
-        assert_eq!(extract_status(&json), vec!["active", "clientDeleteProhibited"]);
+        assert_eq!(
+            extract_nameservers(&json),
+            vec!["ns1.example.com", "ns2.example.com"]
+        );
+        assert_eq!(
+            extract_registrar(&json),
+            Some("Example Registrar".to_string())
+        );
+        assert_eq!(
+            extract_status(&json),
+            vec!["active", "clientDeleteProhibited"]
+        );
         assert_eq!(extract_asn_range(&json), Some((15169, 15169)));
     }
 
@@ -1154,12 +1162,18 @@ mod tests {
         });
 
         // The raw JSON has no "organization" key — this is the broken path
-        assert!(raw.get("organization").is_none(),
-            "Raw RDAP JSON must NOT contain a top-level 'organization' key");
-        assert!(raw.get("cidrs").is_none(),
-            "Raw RDAP JSON must NOT contain a top-level 'cidrs' key");
-        assert!(raw.get("range_start").is_none(),
-            "Raw RDAP JSON must NOT contain a top-level 'range_start' key");
+        assert!(
+            raw.get("organization").is_none(),
+            "Raw RDAP JSON must NOT contain a top-level 'organization' key"
+        );
+        assert!(
+            raw.get("cidrs").is_none(),
+            "Raw RDAP JSON must NOT contain a top-level 'cidrs' key"
+        );
+        assert!(
+            raw.get("range_start").is_none(),
+            "Raw RDAP JSON must NOT contain a top-level 'range_start' key"
+        );
     }
 
     /// parse_ip_response on an ARIN-format response correctly extracts org.
@@ -1190,12 +1204,20 @@ mod tests {
 
         let res = parse_ip_response(raw);
 
-        assert_eq!(res.organization.as_deref(), Some("Microsoft Corporation"),
-            "parse_ip_response must extract org from entities[].vcardArray");
+        assert_eq!(
+            res.organization.as_deref(),
+            Some("Microsoft Corporation"),
+            "parse_ip_response must extract org from entities[].vcardArray"
+        );
         assert_eq!(res.country_code.as_deref(), Some("US"));
-        assert!(res.cidrs.contains(&"20.33.0.0/16".to_string()),
-            "parse_ip_response must extract cidrs from cidr0_cidrs");
-        assert_eq!(res.range, Some(("20.33.0.0".to_string(), "20.128.255.255".to_string())));
+        assert!(
+            res.cidrs.contains(&"20.33.0.0/16".to_string()),
+            "parse_ip_response must extract cidrs from cidr0_cidrs"
+        );
+        assert_eq!(
+            res.range,
+            Some(("20.33.0.0".to_string(), "20.128.255.255".to_string()))
+        );
     }
 
     /// parse_ip_response on a RIPE-format response (uses top-level "name").
@@ -1212,10 +1234,16 @@ mod tests {
         });
 
         let res = parse_ip_response(raw);
-        assert_eq!(res.organization.as_deref(), Some("GOOGL-IPV4"),
-            "Falls back to top-level 'name' when no entities with vcard");
+        assert_eq!(
+            res.organization.as_deref(),
+            Some("GOOGL-IPV4"),
+            "Falls back to top-level 'name' when no entities with vcard"
+        );
         assert_eq!(res.cidrs, vec!["8.8.8.0/24"]);
-        assert_eq!(res.range, Some(("8.8.8.0".to_string(), "8.8.8.255".to_string())));
+        assert_eq!(
+            res.range,
+            Some(("8.8.8.0".to_string(), "8.8.8.255".to_string()))
+        );
     }
 
     /// parse_ip_response on a LACNIC-format response.
@@ -1255,9 +1283,14 @@ mod tests {
         });
 
         let res = parse_ip_response(raw);
-        assert!(res.cidrs.contains(&"198.51.100.0/24".to_string()),
-            "Should fall back to handle as CIDR");
-        assert_eq!(res.range, Some(("198.51.100.0".to_string(), "198.51.100.255".to_string())));
+        assert!(
+            res.cidrs.contains(&"198.51.100.0/24".to_string()),
+            "Should fall back to handle as CIDR"
+        );
+        assert_eq!(
+            res.range,
+            Some(("198.51.100.0".to_string(), "198.51.100.255".to_string()))
+        );
     }
 
     /// Critical regression: the result of parse_ip_response must survive a
@@ -1289,13 +1322,18 @@ mod tests {
         let reloaded: serde_json::Value = from_slice(&bytes).unwrap();
 
         let res = parse_ip_response(reloaded);
-        assert_eq!(res.organization.as_deref(), Some("Microsoft Corporation"),
+        assert_eq!(
+            res.organization.as_deref(),
+            Some("Microsoft Corporation"),
             "Organization must survive cache roundtrip \
-             (regression: raw RDAP has no top-level 'organization' key)");
-        assert_eq!(res.country_code.as_deref(), Some("US"),
-            "Country code must survive cache roundtrip");
-        assert!(!res.cidrs.is_empty(),
-            "CIDRs must survive cache roundtrip");
+             (regression: raw RDAP has no top-level 'organization' key)"
+        );
+        assert_eq!(
+            res.country_code.as_deref(),
+            Some("US"),
+            "Country code must survive cache roundtrip"
+        );
+        assert!(!res.cidrs.is_empty(), "CIDRs must survive cache roundtrip");
     }
 
     // ── parse_domain_response tests ───────────────────────────────────────────
@@ -1370,12 +1408,21 @@ mod tests {
 
         let res = parse_domain_response("example.com", reloaded);
         assert_eq!(res.handle, "EXAMPLE.COM");
-        assert_eq!(res.registrar.as_deref(), Some("Example Registrar Inc"),
-            "Registrar must survive cache roundtrip");
-        assert_eq!(res.nameservers, vec!["ns1.example.com"],
-            "Nameservers must survive cache roundtrip");
-        assert_eq!(res.status, vec!["active"],
-            "Status must survive cache roundtrip");
+        assert_eq!(
+            res.registrar.as_deref(),
+            Some("Example Registrar Inc"),
+            "Registrar must survive cache roundtrip"
+        );
+        assert_eq!(
+            res.nameservers,
+            vec!["ns1.example.com"],
+            "Nameservers must survive cache roundtrip"
+        );
+        assert_eq!(
+            res.status,
+            vec!["active"],
+            "Status must survive cache roundtrip"
+        );
     }
 
     // ── parse_asn_response tests ──────────────────────────────────────────────
@@ -1441,10 +1488,16 @@ mod tests {
         let reloaded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         let res = parse_asn_response(15169, reloaded);
-        assert_eq!(res.organization.as_deref(), Some("Google LLC"),
-            "Organization must survive cache roundtrip");
-        assert_eq!(res.range, Some((15169, 15169)),
-            "ASN range must survive cache roundtrip");
+        assert_eq!(
+            res.organization.as_deref(),
+            Some("Google LLC"),
+            "Organization must survive cache roundtrip"
+        );
+        assert_eq!(
+            res.range,
+            Some((15169, 15169)),
+            "ASN range must survive cache roundtrip"
+        );
     }
 
     // ── Regression guard: parse functions vs. raw-key access ─────────────────
@@ -1467,12 +1520,17 @@ mod tests {
 
         // Simulate the OLD (broken) approach
         let org_broken = arin_response.get("organization").and_then(|v| v.as_str());
-        assert!(org_broken.is_none(),
-            "BROKEN approach: reading 'organization' from raw RDAP is always None");
+        assert!(
+            org_broken.is_none(),
+            "BROKEN approach: reading 'organization' from raw RDAP is always None"
+        );
 
         // Confirm the NEW (correct) approach works
         let res = parse_ip_response(arin_response);
-        assert_eq!(res.organization.as_deref(), Some("Microsoft Corporation"),
-            "CORRECT approach: parse_ip_response extracts org properly");
+        assert_eq!(
+            res.organization.as_deref(),
+            Some("Microsoft Corporation"),
+            "CORRECT approach: parse_ip_response extracts org properly"
+        );
     }
 }

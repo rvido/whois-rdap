@@ -58,7 +58,9 @@ impl BootstrapMap {
         let cache_dir = bootstrap_cache_dir()?;
         tokio::fs::create_dir_all(&cache_dir)
             .await
-            .with_context(|| format!("Cannot create bootstrap cache dir: {}", cache_dir.display()))?;
+            .with_context(|| {
+                format!("Cannot create bootstrap cache dir: {}", cache_dir.display())
+            })?;
 
         let ipv4_path = cache_dir.join("ipv4.json");
         let ipv6_path = cache_dir.join("ipv6.json");
@@ -70,12 +72,18 @@ impl BootstrapMap {
         refresh_file(http, &asn_path, IANA_ASN_URL, force_refresh).await?;
 
         // Parse (sync — files are small, < 50 KB each)
-        let ipv4 = parse_ipv4_bootstrap(&std::fs::read(&ipv4_path)
-            .with_context(|| format!("Cannot read {}", ipv4_path.display()))?)?;
-        let ipv6 = parse_ipv6_bootstrap(&std::fs::read(&ipv6_path)
-            .with_context(|| format!("Cannot read {}", ipv6_path.display()))?)?;
-        let asn = parse_asn_bootstrap(&std::fs::read(&asn_path)
-            .with_context(|| format!("Cannot read {}", asn_path.display()))?)?;
+        let ipv4 = parse_ipv4_bootstrap(
+            &std::fs::read(&ipv4_path)
+                .with_context(|| format!("Cannot read {}", ipv4_path.display()))?,
+        )?;
+        let ipv6 = parse_ipv6_bootstrap(
+            &std::fs::read(&ipv6_path)
+                .with_context(|| format!("Cannot read {}", ipv6_path.display()))?,
+        )?;
+        let asn = parse_asn_bootstrap(
+            &std::fs::read(&asn_path)
+                .with_context(|| format!("Cannot read {}", asn_path.display()))?,
+        )?;
 
         Ok(Self { ipv4, ipv6, asn })
     }
@@ -95,13 +103,12 @@ impl BootstrapMap {
                     .max_by_key(|(net, _)| net.prefix_len())
                     .map(|(_, url)| url.as_ref())
             }
-            IpAddr::V6(v6) => {
-                self.ipv6
-                    .iter()
-                    .filter(|(net, _)| net.contains(&v6))
-                    .max_by_key(|(net, _)| net.prefix_len())
-                    .map(|(_, url)| url.as_ref())
-            }
+            IpAddr::V6(v6) => self
+                .ipv6
+                .iter()
+                .filter(|(net, _)| net.contains(&v6))
+                .max_by_key(|(net, _)| net.prefix_len())
+                .map(|(_, url)| url.as_ref()),
         }
     }
 
@@ -175,12 +182,17 @@ fn parse_ipv4_bootstrap(data: &[u8]) -> Result<Vec<(Ipv4Net, Box<str>)>> {
     for (prefixes, urls) in &parsed.services {
         let url = best_url(urls).ok_or_else(|| anyhow!("IPv4 bootstrap entry has no URLs"))?;
         for prefix in prefixes {
-            let net: Ipv4Net = prefix.parse()
+            let net: Ipv4Net = prefix
+                .parse()
                 .with_context(|| format!("Bad IPv4 prefix in bootstrap: {prefix}"))?;
             out.push((net, url.into()));
         }
     }
-    out.sort_by(|(a, _), (b, _)| a.addr().cmp(&b.addr()).then(a.prefix_len().cmp(&b.prefix_len())));
+    out.sort_by(|(a, _), (b, _)| {
+        a.addr()
+            .cmp(&b.addr())
+            .then(a.prefix_len().cmp(&b.prefix_len()))
+    });
     Ok(out)
 }
 
@@ -191,7 +203,8 @@ fn parse_ipv6_bootstrap(data: &[u8]) -> Result<Vec<(Ipv6Net, Box<str>)>> {
     for (prefixes, urls) in &parsed.services {
         let url = best_url(urls).ok_or_else(|| anyhow!("IPv6 bootstrap entry has no URLs"))?;
         for prefix in prefixes {
-            let net: Ipv6Net = prefix.parse()
+            let net: Ipv6Net = prefix
+                .parse()
                 .with_context(|| format!("Bad IPv6 prefix in bootstrap: {prefix}"))?;
             out.push((net, url.into()));
         }
@@ -227,8 +240,14 @@ fn best_url(urls: &[String]) -> Option<&str> {
 /// Parse "12345-67890" or "12345" into (start, end).
 fn parse_asn_range(s: &str) -> Result<(u32, u32)> {
     if let Some((lo, hi)) = s.split_once('-') {
-        let start: u32 = lo.trim().parse().with_context(|| format!("Bad ASN start: {lo}"))?;
-        let end: u32 = hi.trim().parse().with_context(|| format!("Bad ASN end: {hi}"))?;
+        let start: u32 = lo
+            .trim()
+            .parse()
+            .with_context(|| format!("Bad ASN start: {lo}"))?;
+        let end: u32 = hi
+            .trim()
+            .parse()
+            .with_context(|| format!("Bad ASN end: {hi}"))?;
         Ok((start, end))
     } else {
         let n: u32 = s.trim().parse().with_context(|| format!("Bad ASN: {s}"))?;
@@ -245,13 +264,23 @@ mod tests {
         use ipnet::{Ipv4Net, Ipv6Net};
         BootstrapMap {
             ipv4: vec![
-                ("0.0.0.0/0".parse::<Ipv4Net>().unwrap(), "https://fallback.example".into()),
-                ("8.0.0.0/8".parse::<Ipv4Net>().unwrap(), "https://arin.example".into()),
-                ("8.8.0.0/16".parse::<Ipv4Net>().unwrap(), "https://google.example".into()),
+                (
+                    "0.0.0.0/0".parse::<Ipv4Net>().unwrap(),
+                    "https://fallback.example".into(),
+                ),
+                (
+                    "8.0.0.0/8".parse::<Ipv4Net>().unwrap(),
+                    "https://arin.example".into(),
+                ),
+                (
+                    "8.8.0.0/16".parse::<Ipv4Net>().unwrap(),
+                    "https://google.example".into(),
+                ),
             ],
-            ipv6: vec![
-                ("2001:db8::/32".parse::<Ipv6Net>().unwrap(), "https://ripe.example".into()),
-            ],
+            ipv6: vec![(
+                "2001:db8::/32".parse::<Ipv6Net>().unwrap(),
+                "https://ripe.example".into(),
+            )],
             asn: vec![
                 (1..=9999, "https://arin.example".into()),
                 (15169..=15169, "https://google.example".into()),

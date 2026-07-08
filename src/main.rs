@@ -15,7 +15,6 @@ use whois_rdap::{
     redirect::follow_links,
 };
 
-
 // ── CLI definition ─────────────────────────────────────────────────────────
 
 /// RDAP whois-like client: returns registration details for an IP, Domain, or ASN.
@@ -243,7 +242,8 @@ async fn main() -> Result<()> {
                     // If follow_links returns a different JSON, re-extract.
                     // If unchanged (no useful link found), keep the already-
                     // extracted res — do NOT rebuild from raw.
-                    let followed = follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
+                    let followed =
+                        follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
                     let res = if followed != res.raw {
                         whois_rdap::parse_ip_response(followed)
                     } else {
@@ -274,7 +274,8 @@ async fn main() -> Result<()> {
 
             match client.lookup_domain(&domain).await {
                 Ok(res) => {
-                    let followed = follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
+                    let followed =
+                        follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
                     let res = if followed != res.raw {
                         whois_rdap::parse_domain_response(&domain, followed)
                     } else {
@@ -338,7 +339,11 @@ fn resolve_base_url(
         let found = match query_type {
             QueryType::Ip => q.parse::<IpAddr>().ok().and_then(|ip| map.find_ip(ip)),
             QueryType::Asn => {
-                let digits = if q.len() > 2 && q[..2].eq_ignore_ascii_case("AS") { &q[2..] } else { q };
+                let digits = if q.len() > 2 && q[..2].eq_ignore_ascii_case("AS") {
+                    &q[2..]
+                } else {
+                    q
+                };
                 digits.parse::<u32>().ok().and_then(|asn| map.find_asn(asn))
             }
             QueryType::Domain => None, // Domain bootstrap not in scope
@@ -394,11 +399,23 @@ fn print_ip_result<W: Write>(
     } else {
         writeln!(w, "IP:           {}", ip)?;
         writeln!(w, "RDAP Server:  {}", server)?;
-        writeln!(w, "Organization: {}", res.organization.as_deref().unwrap_or("Unknown"))?;
-        if let Some(ref cc) = res.country_code { writeln!(w, "Country Code: {}", cc)?; }
-        if let Some(n) = res.as_number { writeln!(w, "AS Number:    AS{}", n)?; }
-        if !res.cidrs.is_empty() { writeln!(w, "CIDR(s):      {}", res.cidrs.join(", "))?; }
-        if let Some((ref s, ref e)) = res.range { writeln!(w, "Range:        {} - {}", s, e)?; }
+        writeln!(
+            w,
+            "Organization: {}",
+            res.organization.as_deref().unwrap_or("Unknown")
+        )?;
+        if let Some(ref cc) = res.country_code {
+            writeln!(w, "Country Code: {}", cc)?;
+        }
+        if let Some(n) = res.as_number {
+            writeln!(w, "AS Number:    AS{}", n)?;
+        }
+        if !res.cidrs.is_empty() {
+            writeln!(w, "CIDR(s):      {}", res.cidrs.join(", "))?;
+        }
+        if let Some((ref s, ref e)) = res.range {
+            writeln!(w, "Range:        {} - {}", s, e)?;
+        }
         if res.cidrs.is_empty() && res.range.is_none() {
             writeln!(w, "CIDR/Range:   Not found in RDAP response")?;
         }
@@ -427,9 +444,17 @@ fn print_domain_result<W: Write>(
     } else {
         writeln!(w, "Domain:       {}", res.handle)?;
         writeln!(w, "RDAP Server:  {}", server)?;
-        writeln!(w, "Organization: {}", res.organization.as_deref().unwrap_or("Unknown"))?;
-        if let Some(ref r) = res.registrar { writeln!(w, "Registrar:    {}", r)?; }
-        if let Some(ref cc) = res.country_code { writeln!(w, "Country Code: {}", cc)?; }
+        writeln!(
+            w,
+            "Organization: {}",
+            res.organization.as_deref().unwrap_or("Unknown")
+        )?;
+        if let Some(ref r) = res.registrar {
+            writeln!(w, "Registrar:    {}", r)?;
+        }
+        if let Some(ref cc) = res.country_code {
+            writeln!(w, "Country Code: {}", cc)?;
+        }
         if !res.nameservers.is_empty() {
             writeln!(w, "Name Servers: {}", res.nameservers.join(", "))?;
         }
@@ -459,8 +484,14 @@ fn print_asn_result<W: Write>(
     } else {
         writeln!(w, "ASN:          AS{}", res.asn)?;
         writeln!(w, "RDAP Server:  {}", server)?;
-        writeln!(w, "Organization: {}", res.organization.as_deref().unwrap_or("Unknown"))?;
-        if let Some(ref cc) = res.country_code { writeln!(w, "Country Code: {}", cc)?; }
+        writeln!(
+            w,
+            "Organization: {}",
+            res.organization.as_deref().unwrap_or("Unknown")
+        )?;
+        if let Some(ref cc) = res.country_code {
+            writeln!(w, "Country Code: {}", cc)?;
+        }
         if let Some((s, e)) = res.range {
             if s == e {
                 writeln!(w, "AS Number:    AS{}", s)?;

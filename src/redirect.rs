@@ -24,11 +24,7 @@ use serde_json::Value;
 /// * `http`     — shared reqwest client (connection pool is reused)
 /// * `json`     — already-parsed RDAP response
 /// * `max_hops` — how many redirect hops to follow (0 = no redirect)
-pub async fn follow_links(
-    http: &reqwest::Client,
-    json: Value,
-    max_hops: u8,
-) -> Value {
+pub async fn follow_links(http: &reqwest::Client, json: Value, max_hops: u8) -> Value {
     if max_hops == 0 {
         return json;
     }
@@ -101,8 +97,8 @@ fn find_follow_href<'a>(json: &'a Value, self_href: Option<&str>) -> Option<&'a 
 
 /// Fetch a URL and decode the response as RDAP JSON.
 async fn fetch_href(http: &reqwest::Client, href: &str) -> Result<Value> {
-    let url = reqwest::Url::parse(href)
-        .with_context(|| format!("Invalid redirect href: {href}"))?;
+    let url =
+        reqwest::Url::parse(href).with_context(|| format!("Invalid redirect href: {href}"))?;
 
     let resp = http
         .get(url)
@@ -155,7 +151,10 @@ mod tests {
         });
         let self_href = extract_self_href(&val);
         let href = find_follow_href(&val, self_href);
-        assert_eq!(href, Some("https://rdap.verisign.com/com/v1/domain/google.com"));
+        assert_eq!(
+            href,
+            Some("https://rdap.verisign.com/com/v1/domain/google.com")
+        );
     }
 
     #[test]
