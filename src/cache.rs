@@ -18,6 +18,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -150,6 +151,98 @@ impl Cache {
         })
     }
 
+    /// Range-aware IP lookup.
+    ///
+    /// Checks the exact key first (`ip:<addr>`), then falls back to a range
+    /// containment query: any cached IP-network entry whose `range_start ≤ ip
+    /// ≤ range_end` is returned as a hit.
+    ///
+    /// This means that querying `20.59.128.1` after `20.59.128.0` has already
+    /// been cached (and its response covers `20.33.0.0–20.128.255.255`) returns
+    /// the cached entry without a network round-trip.
+    ///
+    /// Both IPv4 and IPv6 addresses are normalised to a 16-byte big-endian blob
+    /// (IPv4 via `to_ipv6_mapped()`), which makes the BLOB comparison in SQLite
+    /// numerically correct across the entire IP space.
+    pub fn get_ip(&self, ip: IpAddr) -> Result<Option<Value>> {
+        let key = key_ip(&ip);
+        let blob = ip_to_blob(ip);
+        let now = unix_now() as i64;
+        let conn = self.conn.lock().expect("cache mutex poisoned");
+
+        // Single query: exact key match first (cheapest), then range scan.
+        // SQLite compares BLOBs byte-by-byte; big-endian 16-byte blobs compare
+        // numerically, so `range_start <= blob AND range_end >= blob` is a
+        // correct containment test for both IPv4 and IPv6.
+        let mut stmt = conn.prepare_cached(
+            "SELECT payload FROM rdap_cache \
+             WHERE fetched_at + ttl > ?1 \
+               AND (key = ?2 \
+                    OR (range_start IS NOT NULL \
+                        AND range_start <= ?3 \
+                        AND range_end   >= ?3)) \
+             ORDER BY CASE WHEN key = ?2 THEN 0 ELSE 1 END \
+             LIMIT 1",
+        )?;
+
+        let result = stmt
+            .query_row((now, key.as_str(), &blob[..]), |row| {
+                let b = row.get_ref(0)?.as_blob()?;
+                serde_json::from_slice(b).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        Box::new(e),
+                    )
+                })
+            })
+            .optional()?;
+
+        Ok(result)
+    }
+
+    /// Insert or replace an IP-network cache entry, storing the RDAP range
+    /// bounds as 16-byte BLOBs so that future `get_ip` calls for any IP within
+    /// that range will be served from cache.
+    ///
+    /// `range` should be `Some((start_addr, end_addr))` from the parsed RDAP
+    /// `startAddress`/`endAddress` fields.  Pass `None` if the response had no
+    /// range (the entry will still be cached by exact key only).
+    ///
+    /// Write is dispatched to `spawn_blocking`; the caller is never blocked.
+    pub fn insert_ip_background(
+        &self,
+        key: String,
+        value: &Value,
+        range: Option<(IpAddr, IpAddr)>,
+        ttl: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let payload = match serde_json::to_vec(value) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("cache: serialise error for '{key}': {e}");
+                return tokio::task::spawn_blocking(|| {});
+            }
+        };
+        let range_start = range.map(|(s, _)| ip_to_blob(s).to_vec());
+        let range_end   = range.map(|(_, e)| ip_to_blob(e).to_vec());
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let now = unix_now() as i64;
+            if let Ok(conn) = cache.conn.lock() {
+                let r = conn.execute(
+                    "INSERT OR REPLACE INTO rdap_cache \
+                     (key, payload, fetched_at, ttl, range_start, range_end) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![key, payload, now, ttl as i64, range_start, range_end],
+                );
+                if let Err(e) = r {
+                    eprintln!("cache: write error for '{key}': {e}");
+                }
+            }
+        })
+    }
+
     /// Delete all expired entries.  Call occasionally to reclaim disk space.
     pub fn evict_expired(&self) -> Result<usize> {
         let now = unix_now() as i64;
@@ -162,23 +255,47 @@ impl Cache {
 // ── Schema init ───────────────────────────────────────────────────────────────
 
 fn init_schema(conn: &Connection) -> Result<()> {
-    // WAL for concurrent readers; NORMAL sync is fast and crash-safe enough.
+    // 1. Set pragmas.
     conn.execute_batch(
         "
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous  = NORMAL;
         PRAGMA cache_size   = -1024;   -- cap page cache at 1 MB
+        ",
+    )
+    .context("Cannot set pragmas")?;
+
+    // 2. Ensure base table exists (with or without range columns).
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS rdap_cache (
-            key        TEXT    PRIMARY KEY,
-            payload    BLOB    NOT NULL,
-            fetched_at INTEGER NOT NULL,  -- unix seconds
-            ttl        INTEGER NOT NULL   -- seconds until expiry
+            key         TEXT    PRIMARY KEY,
+            payload     BLOB    NOT NULL,
+            fetched_at  INTEGER NOT NULL,  -- unix seconds
+            ttl         INTEGER NOT NULL   -- seconds until expiry
         );
+        ",
+    )
+    .context("Cannot create base cache table")?;
+
+    // 3. Migrate existing databases to add range columns if missing.
+    // ALTER TABLE ADD COLUMN errors if the column already exists; we ignore the error.
+    let _ = conn.execute("ALTER TABLE rdap_cache ADD COLUMN range_start BLOB;", []);
+    let _ = conn.execute("ALTER TABLE rdap_cache ADD COLUMN range_end   BLOB;", []);
+
+    // 4. Ensure indexes exist on the migrated schema.
+    conn.execute_batch(
+        "
         CREATE INDEX IF NOT EXISTS rdap_cache_expiry
             ON rdap_cache (fetched_at + ttl);
-    ",
+        CREATE INDEX IF NOT EXISTS rdap_cache_ranges
+            ON rdap_cache (range_start, range_end)
+            WHERE range_start IS NOT NULL;
+        ",
     )
-    .context("Cannot initialise cache schema")
+    .context("Cannot create indices on cache schema")?;
+
+    Ok(())
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -199,6 +316,23 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Encode any IP address as a 16-byte big-endian blob.
+///
+/// IPv4 addresses are converted to their IPv4-mapped IPv6 form
+/// (`::ffff:a.b.c.d`) before encoding.  This places all IPv4 addresses in a
+/// contiguous sub-range of the 128-bit IPv6 space, so that BLOB comparisons
+/// in SQLite (`range_start <= ? AND range_end >= ?`) remain numerically
+/// correct for both address families without any special-casing.
+///
+/// Two addresses of the same family always produce the same-length blob, so
+/// SQLite's byte-by-byte BLOB ordering IS numeric ordering.
+pub(crate) fn ip_to_blob(ip: IpAddr) -> [u8; 16] {
+    match ip {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => v6.octets(),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -592,5 +726,278 @@ mod tests {
             DEFAULT_TTL_DOMAIN_SECS < DEFAULT_TTL_IP_SECS,
             "Domain TTL must be shorter than IP TTL (domain records change more often)"
         );
+    }
+
+    // ── ip_to_blob encoding ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_ip_to_blob_ipv4_is_16_bytes() {
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        let blob = ip_to_blob(ip);
+        assert_eq!(blob.len(), 16);
+    }
+
+    #[test]
+    fn test_ip_to_blob_ipv6_is_16_bytes() {
+        let ip: IpAddr = "2001:4860:4860::8888".parse().unwrap();
+        let blob = ip_to_blob(ip);
+        assert_eq!(blob.len(), 16);
+    }
+
+    #[test]
+    fn test_ip_to_blob_ipv4_ordering_matches_numeric() {
+        // Lower IPv4 addresses must produce a lexicographically smaller blob
+        let lo: IpAddr = "20.33.0.0".parse().unwrap();
+        let hi: IpAddr = "20.128.255.255".parse().unwrap();
+        let mid: IpAddr = "20.59.128.1".parse().unwrap();
+
+        let blo = ip_to_blob(lo);
+        let bhi = ip_to_blob(hi);
+        let bmid = ip_to_blob(mid);
+
+        assert!(blo < bmid, "20.33.0.0 blob must be < 20.59.128.1 blob");
+        assert!(bmid < bhi, "20.59.128.1 blob must be < 20.128.255.255 blob");
+        assert!(blo < bhi,  "20.33.0.0 blob must be < 20.128.255.255 blob");
+    }
+
+    #[test]
+    fn test_ip_to_blob_ipv4_min_max() {
+        let min: IpAddr = "0.0.0.0".parse().unwrap();
+        let max: IpAddr = "255.255.255.255".parse().unwrap();
+        assert!(ip_to_blob(min) < ip_to_blob(max));
+    }
+
+    #[test]
+    fn test_ip_to_blob_ipv4_and_ipv6_do_not_overlap() {
+        // IPv4-mapped IPv6 range: ::ffff:0.0.0.0 – ::ffff:255.255.255.255
+        // Pure IPv6 addresses like 2001:: are outside that range
+        let ipv4_max: IpAddr = "255.255.255.255".parse().unwrap();
+        let ipv6_start: IpAddr = "2001::1".parse().unwrap();
+        // 2001::/16 is a completely different part of the IPv6 space from ::ffff::/96
+        // (blob comparison still works because they're in different numeric ranges)
+        let bv4 = ip_to_blob(ipv4_max);
+        let bv6 = ip_to_blob(ipv6_start);
+        // They must not be equal
+        assert_ne!(bv4, bv6);
+    }
+
+    // ── get_ip: exact key match ───────────────────────────────────────────────
+
+    #[test]
+    fn test_get_ip_exact_key_hit() {
+        let cache = open_mem();
+        let val = json!({"objectClassName": "ip network", "name": "GOOGL"});
+        raw_insert(&cache, "ip:8.8.8.8", &val, 3600);
+
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        let result = cache.get_ip(ip).unwrap();
+        assert_eq!(result, Some(val));
+    }
+
+    #[test]
+    fn test_get_ip_exact_key_miss() {
+        let cache = open_mem();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(cache.get_ip(ip).unwrap().is_none());
+    }
+
+    // ── get_ip: range containment ─────────────────────────────────────────────
+
+    /// Core scenario from the user's question:
+    /// Query 20.59.128.0 → cache the Microsoft allocation (20.33.0.0–20.128.255.255).
+    /// Then query 20.59.128.1 and 20.59.129.0 → both must hit the cache without
+    /// a network round-trip.
+    #[tokio::test]
+    async fn test_get_ip_range_hit_for_adjacent_ips_in_same_allocation() {
+        let cache = open_mem();
+
+        // Simulate caching the response for 20.59.128.0
+        let rdap = json!({
+            "objectClassName": "ip network",
+            "startAddress": "20.33.0.0",
+            "endAddress":   "20.128.255.255",
+            "country": "US",
+            "entities": [{
+                "roles": ["registrant"],
+                "vcardArray": ["vcard", [["fn", {}, "text", "Microsoft Corporation"]]]
+            }]
+        });
+
+        let start: IpAddr = "20.33.0.0".parse().unwrap();
+        let end:   IpAddr = "20.128.255.255".parse().unwrap();
+
+        cache.insert_ip_background(
+            "ip:20.59.128.0".to_string(),
+            &rdap,
+            Some((start, end)),
+            86400,
+        ).await.unwrap();
+
+        // 20.59.128.1 — different IP, same allocation → must be a cache HIT
+        let hit1 = cache.get_ip("20.59.128.1".parse().unwrap()).unwrap();
+        assert!(hit1.is_some(),
+            "20.59.128.1 is within 20.33.0.0–20.128.255.255 and must hit the cache");
+
+        // 20.59.129.0 — yet another IP in the range → also a HIT
+        let hit2 = cache.get_ip("20.59.129.0".parse().unwrap()).unwrap();
+        assert!(hit2.is_some(),
+            "20.59.129.0 is within 20.33.0.0–20.128.255.255 and must hit the cache");
+
+        // Verify the returned payload is correct
+        let res = crate::parse_ip_response(hit1.unwrap());
+        assert_eq!(res.organization.as_deref(), Some("Microsoft Corporation"));
+    }
+
+    /// Boundary check: the range endpoints themselves must be hits.
+    #[tokio::test]
+    async fn test_get_ip_range_hit_at_boundaries() {
+        let cache = open_mem();
+        let rdap = json!({"objectClassName": "ip network", "name": "BOUNDARY-TEST"});
+        let start: IpAddr = "10.0.0.0".parse().unwrap();
+        let end:   IpAddr = "10.255.255.255".parse().unwrap();
+
+        cache.insert_ip_background(
+            "ip:10.0.0.1".to_string(), &rdap, Some((start, end)), 3600,
+        ).await.unwrap();
+
+        // Range start
+        assert!(cache.get_ip("10.0.0.0".parse().unwrap()).unwrap().is_some(),
+            "range_start itself must be a cache hit");
+        // Range end
+        assert!(cache.get_ip("10.255.255.255".parse().unwrap()).unwrap().is_some(),
+            "range_end itself must be a cache hit");
+        // Mid-point
+        assert!(cache.get_ip("10.128.0.1".parse().unwrap()).unwrap().is_some(),
+            "mid-range IP must be a cache hit");
+    }
+
+    /// IP just outside the range must be a miss.
+    #[tokio::test]
+    async fn test_get_ip_range_miss_outside_allocation() {
+        let cache = open_mem();
+        let rdap = json!({"objectClassName": "ip network", "name": "MSFT"});
+        let start: IpAddr = "20.33.0.0".parse().unwrap();
+        let end:   IpAddr = "20.128.255.255".parse().unwrap();
+
+        cache.insert_ip_background(
+            "ip:20.59.128.0".to_string(), &rdap, Some((start, end)), 86400,
+        ).await.unwrap();
+
+        // 20.32.255.255 — just before the range → miss
+        assert!(cache.get_ip("20.32.255.255".parse().unwrap()).unwrap().is_none(),
+            "IP before range_start must be a cache miss");
+
+        // 20.129.0.0 — just after the range → miss
+        assert!(cache.get_ip("20.129.0.0".parse().unwrap()).unwrap().is_none(),
+            "IP after range_end must be a cache miss");
+
+        // Completely different /8 → miss
+        assert!(cache.get_ip("8.8.8.8".parse().unwrap()).unwrap().is_none(),
+            "Unrelated IP must be a cache miss");
+    }
+
+    /// Without range bounds stored, only the exact key matches.
+    #[tokio::test]
+    async fn test_get_ip_no_range_only_exact_key_matches() {
+        let cache = open_mem();
+        let rdap = json!({"objectClassName": "ip network"});
+
+        // Insert without range bounds
+        cache.insert_ip_background(
+            "ip:8.8.8.8".to_string(), &rdap, None, 3600,
+        ).await.unwrap();
+
+        // Exact key → hit
+        assert!(cache.get_ip("8.8.8.8".parse().unwrap()).unwrap().is_some());
+
+        // Any other IP → miss (no range to match)
+        assert!(cache.get_ip("8.8.8.9".parse().unwrap()).unwrap().is_none());
+    }
+
+    /// Exact key takes priority over a range match from a different entry.
+    #[tokio::test]
+    async fn test_get_ip_exact_key_preferred_over_range_match() {
+        let cache = open_mem();
+
+        let broad_rdap  = json!({"name": "BROAD-NET"});
+        let exact_rdap  = json!({"name": "EXACT-ENTRY"});
+
+        let s: IpAddr = "10.0.0.0".parse().unwrap();
+        let e: IpAddr = "10.255.255.255".parse().unwrap();
+
+        // Broad range entry for 10.0.0.0/8
+        cache.insert_ip_background(
+            "ip:10.0.0.1".to_string(), &broad_rdap, Some((s, e)), 3600,
+        ).await.unwrap();
+
+        // Exact entry for 10.5.5.5
+        cache.insert_ip_background(
+            "ip:10.5.5.5".to_string(), &exact_rdap, None, 3600,
+        ).await.unwrap();
+
+        // 10.5.5.5 must return the exact entry, not the broad range entry
+        let result = cache.get_ip("10.5.5.5".parse().unwrap()).unwrap().unwrap();
+        assert_eq!(result["name"], "EXACT-ENTRY",
+            "Exact key must take priority over a range match");
+    }
+
+    /// Expired range entries must not be returned even when the range matches.
+    #[tokio::test]
+    async fn test_get_ip_expired_range_is_a_miss() {
+        let cache = open_mem();
+        let rdap = json!({"objectClassName": "ip network", "name": "EXPIRED"});
+
+        // Insert with a past timestamp (already expired)
+        let start: IpAddr = "10.0.0.0".parse().unwrap();
+        let end:   IpAddr = "10.255.255.255".parse().unwrap();
+        {
+            let conn = cache.conn.lock().unwrap();
+            let past = unix_now() as i64 - 9999;
+            let rs = ip_to_blob(start).to_vec();
+            let re = ip_to_blob(end).to_vec();
+            conn.execute(
+                "INSERT OR REPLACE INTO rdap_cache \
+                 (key, payload, fetched_at, ttl, range_start, range_end) \
+                 VALUES (?1, ?2, ?3, 100, ?4, ?5)",
+                rusqlite::params![
+                    "ip:10.0.0.1",
+                    serde_json::to_vec(&rdap).unwrap(),
+                    past,
+                    rs,
+                    re
+                ],
+            ).unwrap();
+        }
+
+        // Any IP in range — must be a miss because the entry is expired
+        assert!(cache.get_ip("10.5.5.5".parse().unwrap()).unwrap().is_none(),
+            "Expired range entry must not be returned");
+    }
+
+    // ── ip_to_blob: IPv6 range containment ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_ip_range_works_for_ipv6() {
+        let cache = open_mem();
+        let rdap = json!({"objectClassName": "ip network", "name": "GOOGLE-IPV6"});
+
+        // Google's 2001:4860::/32 allocation
+        let start: IpAddr = "2001:4860::".parse().unwrap();
+        let end:   IpAddr = "2001:4860:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
+
+        cache.insert_ip_background(
+            "ip:2001:4860:4860::8888".to_string(),
+            &rdap,
+            Some((start, end)),
+            86400,
+        ).await.unwrap();
+
+        // Another address in the same /32 → hit
+        let hit = cache.get_ip("2001:4860:4860::8844".parse().unwrap()).unwrap();
+        assert!(hit.is_some(), "IPv6 range containment must work");
+
+        // Address outside the range → miss
+        let miss = cache.get_ip("2001:db8::1".parse().unwrap()).unwrap();
+        assert!(miss.is_none(), "IPv6 address outside range must be a miss");
     }
 }

@@ -226,10 +226,11 @@ async fn main() -> Result<()> {
             let cache_key = key_ip(&ip);
             let ttl = args.cache_ttl_ip;
 
-            // Cache read — the stored blob is raw RDAP JSON, so we must run
-            // the real extractor suite (parse_ip_response) to recover fields.
+            // Cache read — range-aware: any IP within a previously cached
+            // RDAP allocation (e.g. 20.33.0.0–20.128.255.255) hits here
+            // without a network round-trip, even for a different IP in that range.
             if let Some(ref c) = cache {
-                if let Ok(Some(cached)) = c.get(&cache_key) {
+                if let Ok(Some(cached)) = c.get_ip(ip) {
                     let res = whois_rdap::parse_ip_response(cached);
                     print_ip_result(&mut handle, ip, &base_url, &res, args.json)?;
                     return Ok(());
@@ -250,8 +251,13 @@ async fn main() -> Result<()> {
                         res
                     };
 
+                    // Store range bounds so future lookups for any IP in the
+                    // same allocation are served from cache (no network call).
                     if let Some(ref c) = cache {
-                        c.insert_background(cache_key, &res.raw, ttl);
+                        let range_bounds = res.range.as_ref().and_then(|(s, e)| {
+                            Some((s.parse::<IpAddr>().ok()?, e.parse::<IpAddr>().ok()?))
+                        });
+                        c.insert_ip_background(cache_key, &res.raw, range_bounds, ttl);
                     }
                     print_ip_result(&mut handle, ip, &base_url, &res, args.json)?;
                 }
