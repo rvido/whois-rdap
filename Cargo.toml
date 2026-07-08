@@ -59,6 +59,10 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 [profile.release]
 lto = true
 strip = true
-opt-level = "z"        # optimize for size (network latency dominates anyway)
+opt-level = "z"
 panic = "abort"
 codegen-units = 1      # allows better cross-crate inlining / dead-code elim
+
+# Compile all dependencies with size optimization to shrink binary footprint
+[profile.release.package."*"]
+opt-level = "z"        # optimize for size (network latency dominates anyway)
