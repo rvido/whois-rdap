@@ -17,7 +17,7 @@ use std::time::Duration;
 ///
 /// Returns `Ok(())` the first time, and silently ignores the error on
 /// subsequent calls (rustls returns `Err` if a provider is already installed).
-fn install_ring_provider() {
+pub(crate) fn install_ring_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
@@ -190,6 +190,17 @@ impl RdapClient {
             .user_agent("rdap-client/0.1 (Rust)")
             .timeout(timeout)
             .build()?;
+        Ok(Self { http, base })
+    }
+
+    /// Construct a client for a custom server URL using an existing HTTP client.
+    ///
+    /// Reuses connection pools and TLS sessions from the shared client.
+    pub fn for_custom_with_client(base_url: &str, http: reqwest::Client) -> Result<Self> {
+        install_ring_provider();
+        let base_trimmed = trim_trailing_slash(base_url);
+        let base = reqwest::Url::parse(base_trimmed)
+            .map_err(|e| anyhow!("Invalid base URL '{}': {}", base_url, e))?;
         Ok(Self { http, base })
     }
 

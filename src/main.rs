@@ -197,15 +197,21 @@ async fn main() -> Result<()> {
 
     // ── Multi-target: bulk mode ────────────────────────────────────────────
     if targets.len() > 1 || args.file.is_some() {
-        // For bulk, we use a single client. Bootstrap is best-effort per target
-        // inside the task, but for simplicity we use a generic base.
-        // Use RIPE as a sane default; the user should supply --server for bulk
-        // domain/ASN queries or rely on the bootstrap map (future enhancement:
-        // per-target client resolution).
-        let base_url = resolve_base_url(&args, None, &bootstrap_map, QueryType::Ip);
-        let client = Arc::new(RdapClient::for_custom(&base_url, timeout)?);
+        let http = build_http_client(timeout)?;
+        let ctx = Arc::new(whois_rdap::bulk::BulkContext {
+            http,
+            cache,
+            bootstrap: bootstrap_map,
+            timeout,
+            max_redirects: args.max_redirects.min(3),
+            cache_ttl_ip: args.cache_ttl_ip,
+            cache_ttl_domain: args.cache_ttl_domain,
+            cache_ttl_asn: args.cache_ttl_asn,
+            server: args.server.clone(),
+            rir: args.rir,
+        });
         let mut writer = stdout.lock();
-        bulk_lookup(client, targets.into_iter(), args.concurrency, &mut writer).await?;
+        bulk_lookup(ctx, targets.into_iter(), args.concurrency, &mut writer).await?;
         return Ok(());
     }
 

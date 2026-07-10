@@ -13,7 +13,23 @@ use crate::{RdapAsnResult, RdapClient, RdapDomainResult, RdapResult};
 use anyhow::Result;
 use futures::StreamExt;
 use std::io::Write;
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Configuration context for concurrent bulk lookups.
+pub struct BulkContext {
+    pub http: reqwest::Client,
+    pub cache: Option<crate::cache::Cache>,
+    pub bootstrap: Option<Arc<crate::bootstrap::BootstrapMap>>,
+    pub timeout: Duration,
+    pub max_redirects: u8,
+    pub cache_ttl_ip: u64,
+    pub cache_ttl_domain: u64,
+    pub cache_ttl_asn: u64,
+    pub server: Option<String>,
+    pub rir: Option<crate::RdapRegistry>,
+}
 
 /// One resolved RDAP result (tagged union).
 pub enum BulkRecord {
@@ -98,14 +114,14 @@ fn parse_target(s: &str) -> Target {
 /// Run bulk RDAP lookups and stream NDJSON lines to `writer`.
 ///
 /// # Arguments
-/// * `client`      — shared RDAP client (cloned cheaply per task)
+/// * `ctx`         — bulk lookup configuration context (HTTP, Cache, Bootstrap Map)
 /// * `targets`     — iterator of query strings; consumed lazily
 /// * `concurrency` — max in-flight concurrent lookups (bounded)
 /// * `writer`      — output sink; receives one JSON line per result
 ///
 /// Results are emitted in completion order (fastest first).
 pub async fn bulk_lookup<I, W>(
-    client: Arc<RdapClient>,
+    ctx: Arc<BulkContext>,
     targets: I,
     concurrency: usize,
     writer: &mut W,
@@ -115,8 +131,8 @@ where
     W: Write,
 {
     let stream = futures::stream::iter(targets.map(|raw| {
-        let client = Arc::clone(&client);
-        async move { lookup_one(&client, raw).await }
+        let ctx = Arc::clone(&ctx);
+        async move { lookup_one(&ctx, raw).await }
     }))
     .buffer_unordered(concurrency);
 
@@ -131,20 +147,124 @@ where
     Ok(())
 }
 
-async fn lookup_one(client: &RdapClient, raw: String) -> BulkRecord {
-    match parse_target(&raw) {
+async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
+    let target = parse_target(&raw);
+
+    // 1. Cache hit path (IP range-aware, domain/ASN exact match)
+    if let Some(ref cache) = ctx.cache {
+        match &target {
+            Target::Ip(ip) => {
+                if let Ok(Some(cached)) = cache.get_ip(*ip) {
+                    let res = crate::parse_ip_response(cached);
+                    return BulkRecord::Ip(raw, res);
+                }
+            }
+            Target::Domain(domain) => {
+                let key = crate::cache::key_domain(domain);
+                if let Ok(Some(cached)) = cache.get(&key) {
+                    let res = crate::parse_domain_response(domain, cached);
+                    return BulkRecord::Domain(raw, res);
+                }
+            }
+            Target::Asn(asn) => {
+                let key = crate::cache::key_asn(*asn);
+                if let Ok(Some(cached)) = cache.get(&key) {
+                    let res = crate::parse_asn_response(*asn, cached);
+                    return BulkRecord::Asn(*asn, res);
+                }
+            }
+        }
+    }
+
+    // 2. Cache miss -> network lookup
+    let base_url = resolve_base_url(ctx, &target);
+    let client = match RdapClient::for_custom_with_client(&base_url, ctx.http.clone()) {
+        Ok(c) => c,
+        Err(e) => return BulkRecord::Error(raw, e.to_string()),
+    };
+
+    match target {
         Target::Ip(ip) => match client.lookup_ip(ip).await {
-            Ok(r) => BulkRecord::Ip(raw, r),
+            Ok(res) => {
+                // Follow redirects
+                let followed =
+                    crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
+                        .await;
+                let res = if followed != res.raw {
+                    crate::parse_ip_response(followed)
+                } else {
+                    res
+                };
+                // Write cache
+                if let Some(ref cache) = ctx.cache {
+                    let range_bounds = res.range.as_ref().and_then(|(s, e)| {
+                        Some((s.parse::<IpAddr>().ok()?, e.parse::<IpAddr>().ok()?))
+                    });
+                    let key = crate::cache::key_ip(&ip);
+                    cache.insert_ip_background(key, &res.raw, range_bounds, ctx.cache_ttl_ip);
+                }
+                BulkRecord::Ip(raw, res)
+            }
             Err(e) => BulkRecord::Error(raw, e.to_string()),
         },
         Target::Domain(domain) => match client.lookup_domain(&domain).await {
-            Ok(r) => BulkRecord::Domain(raw, r),
+            Ok(res) => {
+                // Follow redirects
+                let followed =
+                    crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
+                        .await;
+                let res = if followed != res.raw {
+                    crate::parse_domain_response(&domain, followed)
+                } else {
+                    res
+                };
+                // Write cache
+                if let Some(ref cache) = ctx.cache {
+                    let key = crate::cache::key_domain(&domain);
+                    cache.insert_background(key, &res.raw, ctx.cache_ttl_domain);
+                }
+                BulkRecord::Domain(raw, res)
+            }
             Err(e) => BulkRecord::Error(raw, e.to_string()),
         },
         Target::Asn(asn) => match client.lookup_asn(asn).await {
-            Ok(r) => BulkRecord::Asn(asn, r),
+            Ok(res) => {
+                // Write cache
+                if let Some(ref cache) = ctx.cache {
+                    let key = crate::cache::key_asn(asn);
+                    cache.insert_background(key, &res.raw, ctx.cache_ttl_asn);
+                }
+                BulkRecord::Asn(asn, res)
+            }
             Err(e) => BulkRecord::Error(raw, e.to_string()),
         },
+    }
+}
+
+fn resolve_base_url(ctx: &BulkContext, target: &Target) -> String {
+    // 1. Explicit --server wins
+    if let Some(ref s) = ctx.server {
+        return s.clone();
+    }
+    // 2. Explicit --rir wins
+    if let Some(reg) = ctx.rir {
+        return reg.base_url().to_string();
+    }
+    // 3. Bootstrap triage
+    if let Some(ref map) = ctx.bootstrap {
+        let found = match target {
+            Target::Ip(ip) => map.find_ip(*ip),
+            Target::Asn(asn) => map.find_asn(*asn),
+            Target::Domain(_) => None, // Domain bootstrap not in scope
+        };
+        if let Some(url) = found {
+            return url.to_string();
+        }
+    }
+    // 4. Static defaults
+    match target {
+        Target::Ip(_) => crate::RdapRegistry::RIPE.base_url().to_string(),
+        Target::Domain(_) | Target::Asn(_) => crate::RdapRegistry::IANA.base_url().to_string(),
     }
 }
 
@@ -475,14 +595,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_bulk_lookup_streams_one_ndjson_line_per_target() {
-        // Point at a localhost port that has nothing listening
-        let client = Arc::new(
-            crate::RdapClient::for_custom(
-                "http://127.0.0.1:1", // nothing listening here
-                std::time::Duration::from_millis(50),
-            )
-            .expect("client construction must not fail"),
-        );
+        crate::install_ring_provider();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let ctx = Arc::new(BulkContext {
+            http,
+            cache: None,
+            bootstrap: None,
+            timeout: std::time::Duration::from_millis(50),
+            max_redirects: 0,
+            cache_ttl_ip: 3600,
+            cache_ttl_domain: 3600,
+            cache_ttl_asn: 3600,
+            server: Some("http://127.0.0.1:1".to_string()),
+            rir: None,
+        });
 
         let targets = vec![
             "8.8.8.8".to_string(),
@@ -491,7 +620,7 @@ mod tests {
         ];
 
         let mut output = Vec::<u8>::new();
-        bulk_lookup(Arc::clone(&client), targets.into_iter(), 2, &mut output)
+        bulk_lookup(ctx, targets.into_iter(), 2, &mut output)
             .await
             .expect("bulk_lookup must not return Err even when all lookups fail");
 
@@ -521,16 +650,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_bulk_lookup_output_ends_with_newline() {
-        let client = Arc::new(
-            crate::RdapClient::for_custom(
-                "http://127.0.0.1:1",
-                std::time::Duration::from_millis(50),
-            )
-            .unwrap(),
-        );
+        crate::install_ring_provider();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let ctx = Arc::new(BulkContext {
+            http,
+            cache: None,
+            bootstrap: None,
+            timeout: std::time::Duration::from_millis(50),
+            max_redirects: 0,
+            cache_ttl_ip: 3600,
+            cache_ttl_domain: 3600,
+            cache_ttl_asn: 3600,
+            server: Some("http://127.0.0.1:1".to_string()),
+            rir: None,
+        });
+
         let mut output = Vec::<u8>::new();
         bulk_lookup(
-            Arc::clone(&client),
+            ctx,
             std::iter::once("8.8.8.8".to_string()),
             1,
             &mut output,
@@ -546,15 +686,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_bulk_lookup_empty_targets_produces_no_output() {
-        let client = Arc::new(
-            crate::RdapClient::for_custom(
-                "http://127.0.0.1:1",
-                std::time::Duration::from_millis(50),
-            )
-            .unwrap(),
-        );
+        crate::install_ring_provider();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let ctx = Arc::new(BulkContext {
+            http,
+            cache: None,
+            bootstrap: None,
+            timeout: std::time::Duration::from_millis(50),
+            max_redirects: 0,
+            cache_ttl_ip: 3600,
+            cache_ttl_domain: 3600,
+            cache_ttl_asn: 3600,
+            server: Some("http://127.0.0.1:1".to_string()),
+            rir: None,
+        });
+
         let mut output = Vec::<u8>::new();
-        bulk_lookup(Arc::clone(&client), std::iter::empty(), 4, &mut output)
+        bulk_lookup(ctx, std::iter::empty(), 4, &mut output)
             .await
             .unwrap();
 
