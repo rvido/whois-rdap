@@ -124,13 +124,8 @@ impl BootstrapMap {
 // ── Bootstrap file management ────────────────────────────────────────────────
 
 fn bootstrap_cache_dir() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".cache")
-        });
-    Ok(base.join("whois-rdap").join("bootstrap"))
+    let base = crate::default_cache_base()?;
+    Ok(base.join("bootstrap"))
 }
 
 async fn refresh_file(

@@ -301,13 +301,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn cache_db_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".cache")
-        });
-    Ok(base.join("whois-rdap").join("cache.db"))
+    let base = crate::default_cache_base()?;
+    Ok(base.join("cache.db"))
 }
 
 /// Current time as unix seconds (u64).

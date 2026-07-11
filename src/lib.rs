@@ -21,6 +21,36 @@ pub(crate) fn install_ring_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Resolve the default base cache directory for the process, accounting for
+/// custom environments, missing/fallback HOME, or embedded devices.
+pub(crate) fn default_cache_base() -> Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    // 1. Respect XDG_CACHE_HOME if it is set and not empty.
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        let path = PathBuf::from(xdg);
+        if !path.as_os_str().is_empty() {
+            return Ok(path.join("whois-rdap"));
+        }
+    }
+
+    // 2. Check HOME env var.
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_path = PathBuf::from(home);
+        if !home_path.as_os_str().is_empty()
+            && home_path != PathBuf::from("/root")
+            && home_path != PathBuf::from("/")
+        {
+            return Ok(home_path.join(".cache").join("whois-rdap"));
+        }
+    }
+
+    // 3. Safe fallback for embedded devices, root execution, or container environments.
+    // std::env::temp_dir() is universally writable and available (e.g. /tmp on Linux).
+    Ok(std::env::temp_dir().join("whois-rdap"))
+}
+
+
 /// Well-known RDAP registries (RIRs + IANA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RdapRegistry {
