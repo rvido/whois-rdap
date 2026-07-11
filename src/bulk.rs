@@ -12,10 +12,18 @@
 use crate::{RdapAsnResult, RdapClient, RdapDomainResult, RdapResult};
 use anyhow::Result;
 use futures::StreamExt;
+use serde_json::Value;
 use std::io::Write;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// In-flight query state for SingleFlight request collapsing.
+#[derive(Clone, Debug)]
+pub enum QueryState {
+    Pending,
+    Ready((String, Result<Value, String>)),
+}
 
 /// Configuration context for concurrent bulk lookups.
 pub struct BulkContext {
@@ -29,6 +37,9 @@ pub struct BulkContext {
     pub cache_ttl_asn: u64,
     pub server: Option<String>,
     pub rir: Option<crate::RdapRegistry>,
+    pub active_queries: tokio::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::watch::Sender<QueryState>>
+    >,
 }
 
 /// One resolved RDAP result (tagged union).
@@ -147,8 +158,47 @@ where
     Ok(())
 }
 
+impl BulkContext {
+    /// Finish an active query by sending its result to all waiters and removing it from the map.
+    pub async fn finish_query(&self, key: &str, result: (String, Result<Value, String>)) {
+        let mut active = self.active_queries.lock().await;
+        if let Some(tx) = active.remove(key) {
+            let _ = tx.send(QueryState::Ready(result));
+        }
+    }
+}
+
+fn get_group_key(target: &Target) -> String {
+    match target {
+        Target::Ip(ip) => match ip {
+            IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                // Group by /16 to collapse queries within the same broad provider block
+                format!("group:ipv4:{}.{}", octets[0], octets[1])
+            }
+            IpAddr::V6(ipv6) => {
+                let segments = ipv6.segments();
+                // Group by /48 for IPv6
+                format!("group:ipv6:{:x}:{:x}:{:x}", segments[0], segments[1], segments[2])
+            }
+        },
+        Target::Domain(domain) => {
+            format!("group:domain:{}", domain)
+        }
+        Target::Asn(asn) => {
+            format!("group:asn:{}", asn)
+        }
+    }
+}
+
 async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
     let target = parse_target(&raw);
+    let cache_key = match &target {
+        Target::Ip(ip) => crate::cache::key_ip(ip),
+        Target::Domain(domain) => crate::cache::key_domain(domain),
+        Target::Asn(asn) => crate::cache::key_asn(*asn),
+    };
+    let group_key = get_group_key(&target);
 
     // 1. Cache hit path (IP range-aware, domain/ASN exact match)
     if let Some(ref cache) = ctx.cache {
@@ -160,15 +210,13 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
                 }
             }
             Target::Domain(domain) => {
-                let key = crate::cache::key_domain(domain);
-                if let Ok(Some(cached)) = cache.get(&key) {
+                if let Ok(Some(cached)) = cache.get(&cache_key) {
                     let res = crate::parse_domain_response(domain, cached);
                     return BulkRecord::Domain(raw, res);
                 }
             }
             Target::Asn(asn) => {
-                let key = crate::cache::key_asn(*asn);
-                if let Ok(Some(cached)) = cache.get(&key) {
+                if let Ok(Some(cached)) = cache.get(&cache_key) {
                     let res = crate::parse_asn_response(*asn, cached);
                     return BulkRecord::Asn(*asn, res);
                 }
@@ -176,14 +224,86 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         }
     }
 
-    // 2. Cache miss -> network lookup
+    // 2. Check/Register in-flight request (SingleFlight collapsing by prefix group key)
+    let rx = {
+        let mut active = ctx.active_queries.lock().await;
+        if let Some(tx) = active.get(&group_key) {
+            Some(tx.subscribe())
+        } else {
+            let (tx, _) = tokio::sync::watch::channel(QueryState::Pending);
+            active.insert(group_key.clone(), tx);
+            None // We are the initiator
+        }
+    };
+
+    if let Some(mut rx) = rx {
+        // We are a waiter. Wait for the initiator to complete.
+        loop {
+            if let QueryState::Ready((ref initiator_key, ref res)) = *rx.borrow() {
+                // If it's an exact target match, we reuse the initiator's result (success or failure) directly.
+                if cache_key == *initiator_key {
+                    match res {
+                        Ok(val) => {
+                            match &target {
+                                Target::Ip(_) => return BulkRecord::Ip(raw, crate::parse_ip_response(val.clone())),
+                                Target::Domain(domain) => return BulkRecord::Domain(raw, crate::parse_domain_response(domain, val.clone())),
+                                Target::Asn(asn) => return BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, val.clone())),
+                            }
+                        }
+                        Err(err) => {
+                            return BulkRecord::Error(raw, err.clone());
+                        }
+                    }
+                }
+
+                // The initiator completed successfully. Re-check the database cache
+                // to see if the returned range (or exact match) covers our IP.
+                match res {
+                    Ok(_) => {
+                        if let Some(ref cache) = ctx.cache {
+                            match &target {
+                                Target::Ip(ip) => {
+                                    if let Ok(Some(cached)) = cache.get_ip(*ip) {
+                                        return BulkRecord::Ip(raw, crate::parse_ip_response(cached));
+                                    }
+                                }
+                                Target::Domain(domain) => {
+                                    if let Ok(Some(cached)) = cache.get(&cache_key) {
+                                        return BulkRecord::Domain(raw, crate::parse_domain_response(domain, cached));
+                                    }
+                                }
+                                Target::Asn(asn) => {
+                                    if let Ok(Some(cached)) = cache.get(&cache_key) {
+                                        return BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, cached));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+                // If it's still a cache miss (e.g. they are in different allocations in the same /16),
+                // break out and proceed to execute our own network query.
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    // 3. We are the initiator (or waiter whose leader range didn't cover us) -> network lookup
     let base_url = resolve_base_url(ctx, &target);
     let client = match RdapClient::for_custom_with_client(&base_url, ctx.http.clone()) {
         Ok(c) => c,
-        Err(e) => return BulkRecord::Error(raw, e.to_string()),
+        Err(e) => {
+            let err_msg = e.to_string();
+            ctx.finish_query(&group_key, (cache_key.clone(), Err(err_msg.clone()))).await;
+            return BulkRecord::Error(raw, err_msg);
+        }
     };
 
-    match target {
+    let result = match target {
         Target::Ip(ip) => match client.lookup_ip(ip).await {
             Ok(res) => {
                 // Follow redirects
@@ -200,12 +320,11 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
                     let range_bounds = res.range.as_ref().and_then(|(s, e)| {
                         Some((s.parse::<IpAddr>().ok()?, e.parse::<IpAddr>().ok()?))
                     });
-                    let key = crate::cache::key_ip(&ip);
-                    cache.insert_ip_background(key, &res.raw, range_bounds, ctx.cache_ttl_ip);
+                    cache.insert_ip_background(cache_key.clone(), &res.raw, range_bounds, ctx.cache_ttl_ip);
                 }
-                BulkRecord::Ip(raw, res)
+                Ok(res.raw)
             }
-            Err(e) => BulkRecord::Error(raw, e.to_string()),
+            Err(e) => Err(e.to_string()),
         },
         Target::Domain(domain) => match client.lookup_domain(&domain).await {
             Ok(res) => {
@@ -220,25 +339,38 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
                 };
                 // Write cache
                 if let Some(ref cache) = ctx.cache {
-                    let key = crate::cache::key_domain(&domain);
-                    cache.insert_background(key, &res.raw, ctx.cache_ttl_domain);
+                    cache.insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_domain);
                 }
-                BulkRecord::Domain(raw, res)
+                Ok(res.raw)
             }
-            Err(e) => BulkRecord::Error(raw, e.to_string()),
+            Err(e) => Err(e.to_string()),
         },
         Target::Asn(asn) => match client.lookup_asn(asn).await {
             Ok(res) => {
                 // Write cache
                 if let Some(ref cache) = ctx.cache {
-                    let key = crate::cache::key_asn(asn);
-                    cache.insert_background(key, &res.raw, ctx.cache_ttl_asn);
+                    cache.insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_asn);
                 }
-                BulkRecord::Asn(asn, res)
+                Ok(res.raw)
             }
-            Err(e) => BulkRecord::Error(raw, e.to_string()),
+            Err(e) => Err(e.to_string()),
         },
-    }
+    };
+
+    // 4. Resolve our own return value
+    let record = match &result {
+        Ok(val) => match &parse_target(&raw) {
+            Target::Ip(_) => BulkRecord::Ip(raw, crate::parse_ip_response(val.clone())),
+            Target::Domain(domain) => BulkRecord::Domain(raw, crate::parse_domain_response(domain, val.clone())),
+            Target::Asn(asn) => BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, val.clone())),
+        },
+        Err(err) => BulkRecord::Error(raw, err.clone()),
+    };
+
+    // 5. Broadcast to waiters and clean up active map
+    ctx.finish_query(&group_key, (cache_key, result)).await;
+
+    record
 }
 
 fn resolve_base_url(ctx: &BulkContext, target: &Target) -> String {
@@ -611,6 +743,7 @@ mod tests {
             cache_ttl_asn: 3600,
             server: Some("http://127.0.0.1:1".to_string()),
             rir: None,
+            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let targets = vec![
@@ -666,6 +799,7 @@ mod tests {
             cache_ttl_asn: 3600,
             server: Some("http://127.0.0.1:1".to_string()),
             rir: None,
+            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let mut output = Vec::<u8>::new();
@@ -702,6 +836,7 @@ mod tests {
             cache_ttl_asn: 3600,
             server: Some("http://127.0.0.1:1".to_string()),
             rir: None,
+            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let mut output = Vec::<u8>::new();
@@ -710,5 +845,52 @@ mod tests {
             .unwrap();
 
         assert!(output.is_empty(), "No targets must produce no output");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_lookup_collapses_duplicate_network_requests() {
+        crate::install_ring_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn a background task to count connection attempts.
+        // Since all requests collapse into one, there should be exactly ONE connection accepted.
+        let conn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conn_count_clone = Arc::clone(&conn_count);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                conn_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Send a dummy HTTP 404 response to satisfy the reqwest client
+                use tokio::io::AsyncWriteExt;
+                let _ = socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+            }
+        });
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let ctx = Arc::new(BulkContext {
+            http,
+            cache: None,
+            bootstrap: None,
+            timeout: std::time::Duration::from_millis(500),
+            max_redirects: 0,
+            cache_ttl_ip: 3600,
+            cache_ttl_domain: 3600,
+            cache_ttl_asn: 3600,
+            server: Some(format!("http://{}", addr)),
+            rir: None,
+            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        // 10 duplicate queries running with high concurrency
+        let targets = vec!["8.8.8.8".to_string(); 10];
+        let mut output = Vec::<u8>::new();
+        bulk_lookup(ctx, targets.into_iter(), 10, &mut output).await.unwrap();
+
+        // The connections accepted by our TCP listener must be exactly 1!
+        let count = conn_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(count, 1, "Expected exactly 1 network query due to SingleFlight collapsing, but got {}", count);
     }
 }

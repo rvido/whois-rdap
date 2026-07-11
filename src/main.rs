@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
             cache_ttl_asn: args.cache_ttl_asn,
             server: args.server.clone(),
             rir: args.rir,
+            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let mut writer = stdout.lock();
         bulk_lookup(ctx, targets.into_iter(), args.concurrency, &mut writer).await?;
