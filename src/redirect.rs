@@ -77,7 +77,7 @@ fn find_follow_href<'a>(json: &'a Value, self_href: Option<&str>) -> Option<&'a 
     let links = json.get("links").and_then(|v| v.as_array())?;
 
     // Preferred: rel=related, type=application/rdap+json
-    let candidate = links.iter().find_map(|link| {
+    links.iter().find_map(|link| {
         let rel = link.get("rel").and_then(|v| v.as_str())?;
         let mime = link.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let href = link.get("href").and_then(|v| v.as_str())?;
@@ -90,9 +90,7 @@ fn find_follow_href<'a>(json: &'a Value, self_href: Option<&str>) -> Option<&'a 
         } else {
             None
         }
-    });
-
-    candidate
+    })
 }
 
 /// Fetch a URL and decode the response as RDAP JSON.

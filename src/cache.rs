@@ -55,12 +55,22 @@ pub fn key_asn(asn: u32) -> String {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Number of pooled connections opened for an on-disk cache.
+///
+/// SQLite's WAL mode (enabled in `init_schema`) allows one writer and many
+/// concurrent readers, but a `rusqlite::Connection` itself is not `Sync` —
+/// spreading access across a small fixed pool (rather than one connection
+/// behind a single global lock) lets concurrent bulk-mode reads actually
+/// benefit from WAL instead of all serialising on one mutex.
+const POOL_SIZE: usize = 4;
+
 /// Shared, thread-safe SQLite cache handle.
 ///
-/// Clone is cheap — it's just an `Arc` bump.
+/// Clone is cheap — it's just two `Arc` bumps.
 #[derive(Clone)]
 pub struct Cache {
-    conn: Arc<Mutex<Connection>>,
+    conns: Arc<Vec<Mutex<Connection>>>,
+    next: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Cache {
@@ -75,12 +85,34 @@ impl Cache {
     }
 
     /// Open a cache at an explicit path.  Use `":memory:"` in tests.
+    ///
+    /// `:memory:` databases are private per-connection in SQLite (no shared
+    /// cache), so a pool would silently give each connection its own empty
+    /// database; we always use a single connection for `:memory:`, and a
+    /// small pool for real on-disk files.
     pub fn open_at(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let conn = Connection::open(path).context("Cannot open cache database")?;
-        init_schema(&conn)?;
+        let path = path.as_ref();
+        let pool_size = if path.as_os_str() == ":memory:" {
+            1
+        } else {
+            POOL_SIZE
+        };
+        let mut conns = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let conn = Connection::open(path).context("Cannot open cache database")?;
+            init_schema(&conn)?;
+            conns.push(Mutex::new(conn));
+        }
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conns: Arc::new(conns),
+            next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Pick the next pooled connection (round-robin).
+    fn conn(&self) -> &Mutex<Connection> {
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.conns.len();
+        &self.conns[idx]
     }
 
     /// Look up a key.  Returns `None` on cache miss or if the entry is expired.
@@ -90,7 +122,7 @@ impl Cache {
     /// is ever allocated.
     pub fn get(&self, key: &str) -> Result<Option<Value>> {
         let now = unix_now();
-        let conn = self.conn.lock().expect("cache mutex poisoned");
+        let conn = self.conn().lock().expect("cache mutex poisoned");
 
         // Single indexed SELECT; expiry check in SQL avoids loading stale rows.
         let mut stmt = conn.prepare_cached(
@@ -138,7 +170,7 @@ impl Cache {
         let cache = self.clone();
         tokio::task::spawn_blocking(move || {
             let now = unix_now() as i64;
-            if let Ok(conn) = cache.conn.lock() {
+            if let Ok(conn) = cache.conn().lock() {
                 let r = conn.execute(
                     "INSERT OR REPLACE INTO rdap_cache (key, payload, fetched_at, ttl) \
                      VALUES (?1, ?2, ?3, ?4)",
@@ -168,37 +200,71 @@ impl Cache {
         let key = key_ip(&ip);
         let blob = ip_to_blob(ip);
         let now = unix_now() as i64;
-        let conn = self.conn.lock().expect("cache mutex poisoned");
+        let conn = self.conn().lock().expect("cache mutex poisoned");
 
-        // Single query: exact key match first (cheapest), then range scan.
-        // SQLite compares BLOBs byte-by-byte; big-endian 16-byte blobs compare
-        // numerically, so `range_start <= blob AND range_end >= blob` is a
-        // correct containment test for both IPv4 and IPv6.
+        // Fetch every candidate row (exact key match, plus any range that
+        // contains `ip`) rather than picking one in SQL: an exact key must
+        // always win, and among range matches the *narrowest* range must
+        // win (e.g. a reassigned /24 nested inside a cached /8 allocation),
+        // which SQLite's simple `ORDER BY ... LIMIT 1` on key-match alone
+        // cannot express. Candidate counts are tiny in practice (a handful
+        // of overlapping allocations at most), so scoring in Rust is cheap.
         let mut stmt = conn.prepare_cached(
-            "SELECT payload FROM rdap_cache \
+            "SELECT payload, key, range_start, range_end FROM rdap_cache \
              WHERE fetched_at + ttl > ?1 \
                AND (key = ?2 \
                     OR (range_start IS NOT NULL \
                         AND range_start <= ?3 \
-                        AND range_end   >= ?3)) \
-             ORDER BY CASE WHEN key = ?2 THEN 0 ELSE 1 END \
-             LIMIT 1",
+                        AND range_end   >= ?3))",
         )?;
 
-        let result = stmt
-            .query_row((now, key.as_str(), &blob[..]), |row| {
-                let b = row.get_ref(0)?.as_blob()?;
-                serde_json::from_slice(b).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Blob,
-                        Box::new(e),
-                    )
-                })
-            })
-            .optional()?;
+        let mut rows = stmt.query((now, key.as_str(), &blob[..]))?;
 
-        Ok(result)
+        // (is_exact, range_width, payload) — narrower width wins; exact key
+        // always outranks any range match, matched or not.
+        let mut best: Option<(bool, Option<u128>, Value)> = None;
+        while let Some(row) = rows.next()? {
+            let row_key: String = row.get(1)?;
+            let is_exact = row_key == key;
+            let range_start: Option<Vec<u8>> = row.get(2)?;
+            let range_end: Option<Vec<u8>> = row.get(3)?;
+            let width = match (range_start, range_end) {
+                (Some(s), Some(e)) if s.len() == 16 && e.len() == 16 => {
+                    let s = u128::from_be_bytes(s.try_into().unwrap());
+                    let e = u128::from_be_bytes(e.try_into().unwrap());
+                    Some(e.saturating_sub(s))
+                }
+                _ => None,
+            };
+            let blob_ref = row.get_ref(0)?.as_blob()?;
+            let payload: Value = serde_json::from_slice(blob_ref).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::new(e),
+                )
+            })?;
+
+            let is_better = match &best {
+                None => true,
+                Some((best_exact, best_width, _)) => {
+                    if is_exact != *best_exact {
+                        is_exact
+                    } else {
+                        match (width, best_width) {
+                            (Some(w), Some(bw)) => w < *bw,
+                            (Some(_), None) => true,
+                            _ => false,
+                        }
+                    }
+                }
+            };
+            if is_better {
+                best = Some((is_exact, width, payload));
+            }
+        }
+
+        Ok(best.map(|(_, _, payload)| payload))
     }
 
     /// Insert or replace an IP-network cache entry, storing the RDAP range
@@ -225,11 +291,11 @@ impl Cache {
             }
         };
         let range_start = range.map(|(s, _)| ip_to_blob(s).to_vec());
-        let range_end   = range.map(|(_, e)| ip_to_blob(e).to_vec());
+        let range_end = range.map(|(_, e)| ip_to_blob(e).to_vec());
         let cache = self.clone();
         tokio::task::spawn_blocking(move || {
             let now = unix_now() as i64;
-            if let Ok(conn) = cache.conn.lock() {
+            if let Ok(conn) = cache.conn().lock() {
                 let r = conn.execute(
                     "INSERT OR REPLACE INTO rdap_cache \
                      (key, payload, fetched_at, ttl, range_start, range_end) \
@@ -246,7 +312,7 @@ impl Cache {
     /// Delete all expired entries.  Call occasionally to reclaim disk space.
     pub fn evict_expired(&self) -> Result<usize> {
         let now = unix_now() as i64;
-        let conn = self.conn.lock().expect("cache mutex poisoned");
+        let conn = self.conn().lock().expect("cache mutex poisoned");
         let n = conn.execute("DELETE FROM rdap_cache WHERE fetched_at + ttl <= ?1", [now])?;
         Ok(n)
     }
@@ -279,9 +345,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
     .context("Cannot create base cache table")?;
 
     // 3. Migrate existing databases to add range columns if missing.
-    // ALTER TABLE ADD COLUMN errors if the column already exists; we ignore the error.
-    let _ = conn.execute("ALTER TABLE rdap_cache ADD COLUMN range_start BLOB;", []);
-    let _ = conn.execute("ALTER TABLE rdap_cache ADD COLUMN range_end   BLOB;", []);
+    add_column_if_missing(conn, "ALTER TABLE rdap_cache ADD COLUMN range_start BLOB;")?;
+    add_column_if_missing(conn, "ALTER TABLE rdap_cache ADD COLUMN range_end   BLOB;")?;
 
     // 4. Ensure indexes exist on the migrated schema.
     conn.execute_batch(
@@ -296,6 +361,22 @@ fn init_schema(conn: &Connection) -> Result<()> {
     .context("Cannot create indices on cache schema")?;
 
     Ok(())
+}
+
+/// Run an `ALTER TABLE ... ADD COLUMN` migration, tolerating only the
+/// specific "duplicate column name" error SQLite raises when the column was
+/// already added by a previous run. Any other failure (disk full, locked
+/// file, corrupt schema) is propagated instead of being silently swallowed.
+fn add_column_if_missing(conn: &Connection, ddl: &str) -> Result<()> {
+    match conn.execute(ddl, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("Cannot migrate cache schema: {ddl}")),
+    }
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -343,7 +424,7 @@ mod tests {
 
     // helper: synchronous SQL insert (bypasses insert_background for setup)
     fn raw_insert(cache: &Cache, key: &str, val: &Value, ttl: i64) {
-        let conn = cache.conn.lock().unwrap();
+        let conn = cache.conns[0].lock().unwrap();
         let now = unix_now() as i64;
         conn.execute(
             "INSERT OR REPLACE INTO rdap_cache (key, payload, fetched_at, ttl) \
@@ -354,7 +435,7 @@ mod tests {
     }
 
     fn raw_insert_past(cache: &Cache, key: &str, val: &Value, ttl: i64, age_secs: i64) {
-        let conn = cache.conn.lock().unwrap();
+        let conn = cache.conns[0].lock().unwrap();
         let past = unix_now() as i64 - age_secs;
         conn.execute(
             "INSERT OR REPLACE INTO rdap_cache (key, payload, fetched_at, ttl) \
@@ -544,6 +625,41 @@ mod tests {
         );
     }
 
+    /// On-disk caches use a small connection pool (POOL_SIZE > 1). A write
+    /// via one pooled connection must be visible to reads that round-robin
+    /// onto a *different* pooled connection — otherwise the pool would
+    /// silently fragment the cache instead of just spreading lock contention.
+    #[tokio::test]
+    async fn test_pooled_connections_share_the_same_on_disk_database() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rdap_pool_test_{}.db", std::process::id()));
+        let cache = Cache::open_at(&path).expect("open temp db");
+        assert!(
+            cache.conns.len() > 1,
+            "on-disk cache must open a pool with more than one connection"
+        );
+
+        let val = json!({"objectClassName": "ip network", "name": "POOLED"});
+        cache
+            .insert_background("ip:10.0.0.9".to_string(), &val, 3600)
+            .await
+            .unwrap();
+
+        // Read POOL_SIZE times so we're guaranteed to round-robin across
+        // every pooled connection at least once.
+        for _ in 0..cache.conns.len() {
+            let result = cache.get("ip:10.0.0.9").unwrap();
+            assert!(
+                result.is_some(),
+                "Write must be visible regardless of which pooled connection serves the read"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
     // ── Full RDAP roundtrips (write → cache → parse) ──────────────────────────
 
     #[tokio::test]
@@ -672,7 +788,7 @@ mod tests {
     #[test]
     fn test_cache_size_pragma_is_1mb() {
         let cache = open_mem();
-        let conn = cache.conn.lock().unwrap();
+        let conn = cache.conns[0].lock().unwrap();
         let size: i64 = conn
             .query_row("PRAGMA cache_size", [], |r| r.get(0))
             .unwrap();
@@ -682,7 +798,7 @@ mod tests {
     #[test]
     fn test_expiry_index_exists() {
         let cache = open_mem();
-        let conn = cache.conn.lock().unwrap();
+        let conn = cache.conns[0].lock().unwrap();
         let n: i32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master \
@@ -695,11 +811,33 @@ mod tests {
     }
 
     #[test]
+    fn test_add_column_if_missing_is_idempotent() {
+        // Running schema init twice on the same connection (simulating a
+        // reopened database that already has the range columns) must not
+        // error — "duplicate column name" is the expected, tolerated case.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_add_column_if_missing_propagates_real_errors() {
+        // A failure that is NOT "duplicate column name" (e.g. the target
+        // table doesn't exist) must be propagated, not silently swallowed.
+        let conn = Connection::open_in_memory().unwrap();
+        let result = add_column_if_missing(&conn, "ALTER TABLE no_such_table ADD COLUMN x BLOB;");
+        assert!(
+            result.is_err(),
+            "A real ALTER TABLE failure must be returned as an error, not swallowed"
+        );
+    }
+
+    #[test]
     fn test_wal_mode_applied_on_disk() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("rdap_wal_test_{}.db", std::process::id()));
         let cache = Cache::open_at(&path).expect("open temp db");
-        let conn = cache.conn.lock().unwrap();
+        let conn = cache.conns[0].lock().unwrap();
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
@@ -717,10 +855,12 @@ mod tests {
         assert_eq!(DEFAULT_TTL_IP_SECS, 86_400, "IP TTL must be 24 h");
         assert_eq!(DEFAULT_TTL_DOMAIN_SECS, 28_800, "Domain TTL must be 8 h");
         assert_eq!(DEFAULT_TTL_ASN_SECS, 86_400, "ASN TTL must be 24 h");
-        assert!(
-            DEFAULT_TTL_DOMAIN_SECS < DEFAULT_TTL_IP_SECS,
-            "Domain TTL must be shorter than IP TTL (domain records change more often)"
-        );
+        const {
+            assert!(
+                DEFAULT_TTL_DOMAIN_SECS < DEFAULT_TTL_IP_SECS,
+                "Domain TTL must be shorter than IP TTL (domain records change more often)"
+            );
+        }
     }
 
     // ── ip_to_blob encoding ───────────────────────────────────────────────────
@@ -752,7 +892,7 @@ mod tests {
 
         assert!(blo < bmid, "20.33.0.0 blob must be < 20.59.128.1 blob");
         assert!(bmid < bhi, "20.59.128.1 blob must be < 20.128.255.255 blob");
-        assert!(blo < bhi,  "20.33.0.0 blob must be < 20.128.255.255 blob");
+        assert!(blo < bhi, "20.33.0.0 blob must be < 20.128.255.255 blob");
     }
 
     #[test]
@@ -819,24 +959,31 @@ mod tests {
         });
 
         let start: IpAddr = "20.33.0.0".parse().unwrap();
-        let end:   IpAddr = "20.128.255.255".parse().unwrap();
+        let end: IpAddr = "20.128.255.255".parse().unwrap();
 
-        cache.insert_ip_background(
-            "ip:20.59.128.0".to_string(),
-            &rdap,
-            Some((start, end)),
-            86400,
-        ).await.unwrap();
+        cache
+            .insert_ip_background(
+                "ip:20.59.128.0".to_string(),
+                &rdap,
+                Some((start, end)),
+                86400,
+            )
+            .await
+            .unwrap();
 
         // 20.59.128.1 — different IP, same allocation → must be a cache HIT
         let hit1 = cache.get_ip("20.59.128.1".parse().unwrap()).unwrap();
-        assert!(hit1.is_some(),
-            "20.59.128.1 is within 20.33.0.0–20.128.255.255 and must hit the cache");
+        assert!(
+            hit1.is_some(),
+            "20.59.128.1 is within 20.33.0.0–20.128.255.255 and must hit the cache"
+        );
 
         // 20.59.129.0 — yet another IP in the range → also a HIT
         let hit2 = cache.get_ip("20.59.129.0".parse().unwrap()).unwrap();
-        assert!(hit2.is_some(),
-            "20.59.129.0 is within 20.33.0.0–20.128.255.255 and must hit the cache");
+        assert!(
+            hit2.is_some(),
+            "20.59.129.0 is within 20.33.0.0–20.128.255.255 and must hit the cache"
+        );
 
         // Verify the returned payload is correct
         let res = crate::parse_ip_response(hit1.unwrap());
@@ -849,21 +996,34 @@ mod tests {
         let cache = open_mem();
         let rdap = json!({"objectClassName": "ip network", "name": "BOUNDARY-TEST"});
         let start: IpAddr = "10.0.0.0".parse().unwrap();
-        let end:   IpAddr = "10.255.255.255".parse().unwrap();
+        let end: IpAddr = "10.255.255.255".parse().unwrap();
 
-        cache.insert_ip_background(
-            "ip:10.0.0.1".to_string(), &rdap, Some((start, end)), 3600,
-        ).await.unwrap();
+        cache
+            .insert_ip_background("ip:10.0.0.1".to_string(), &rdap, Some((start, end)), 3600)
+            .await
+            .unwrap();
 
         // Range start
-        assert!(cache.get_ip("10.0.0.0".parse().unwrap()).unwrap().is_some(),
-            "range_start itself must be a cache hit");
+        assert!(
+            cache.get_ip("10.0.0.0".parse().unwrap()).unwrap().is_some(),
+            "range_start itself must be a cache hit"
+        );
         // Range end
-        assert!(cache.get_ip("10.255.255.255".parse().unwrap()).unwrap().is_some(),
-            "range_end itself must be a cache hit");
+        assert!(
+            cache
+                .get_ip("10.255.255.255".parse().unwrap())
+                .unwrap()
+                .is_some(),
+            "range_end itself must be a cache hit"
+        );
         // Mid-point
-        assert!(cache.get_ip("10.128.0.1".parse().unwrap()).unwrap().is_some(),
-            "mid-range IP must be a cache hit");
+        assert!(
+            cache
+                .get_ip("10.128.0.1".parse().unwrap())
+                .unwrap()
+                .is_some(),
+            "mid-range IP must be a cache hit"
+        );
     }
 
     /// IP just outside the range must be a miss.
@@ -872,23 +1032,41 @@ mod tests {
         let cache = open_mem();
         let rdap = json!({"objectClassName": "ip network", "name": "MSFT"});
         let start: IpAddr = "20.33.0.0".parse().unwrap();
-        let end:   IpAddr = "20.128.255.255".parse().unwrap();
+        let end: IpAddr = "20.128.255.255".parse().unwrap();
 
-        cache.insert_ip_background(
-            "ip:20.59.128.0".to_string(), &rdap, Some((start, end)), 86400,
-        ).await.unwrap();
+        cache
+            .insert_ip_background(
+                "ip:20.59.128.0".to_string(),
+                &rdap,
+                Some((start, end)),
+                86400,
+            )
+            .await
+            .unwrap();
 
         // 20.32.255.255 — just before the range → miss
-        assert!(cache.get_ip("20.32.255.255".parse().unwrap()).unwrap().is_none(),
-            "IP before range_start must be a cache miss");
+        assert!(
+            cache
+                .get_ip("20.32.255.255".parse().unwrap())
+                .unwrap()
+                .is_none(),
+            "IP before range_start must be a cache miss"
+        );
 
         // 20.129.0.0 — just after the range → miss
-        assert!(cache.get_ip("20.129.0.0".parse().unwrap()).unwrap().is_none(),
-            "IP after range_end must be a cache miss");
+        assert!(
+            cache
+                .get_ip("20.129.0.0".parse().unwrap())
+                .unwrap()
+                .is_none(),
+            "IP after range_end must be a cache miss"
+        );
 
         // Completely different /8 → miss
-        assert!(cache.get_ip("8.8.8.8".parse().unwrap()).unwrap().is_none(),
-            "Unrelated IP must be a cache miss");
+        assert!(
+            cache.get_ip("8.8.8.8".parse().unwrap()).unwrap().is_none(),
+            "Unrelated IP must be a cache miss"
+        );
     }
 
     /// Without range bounds stored, only the exact key matches.
@@ -898,9 +1076,10 @@ mod tests {
         let rdap = json!({"objectClassName": "ip network"});
 
         // Insert without range bounds
-        cache.insert_ip_background(
-            "ip:8.8.8.8".to_string(), &rdap, None, 3600,
-        ).await.unwrap();
+        cache
+            .insert_ip_background("ip:8.8.8.8".to_string(), &rdap, None, 3600)
+            .await
+            .unwrap();
 
         // Exact key → hit
         assert!(cache.get_ip("8.8.8.8".parse().unwrap()).unwrap().is_some());
@@ -914,26 +1093,79 @@ mod tests {
     async fn test_get_ip_exact_key_preferred_over_range_match() {
         let cache = open_mem();
 
-        let broad_rdap  = json!({"name": "BROAD-NET"});
-        let exact_rdap  = json!({"name": "EXACT-ENTRY"});
+        let broad_rdap = json!({"name": "BROAD-NET"});
+        let exact_rdap = json!({"name": "EXACT-ENTRY"});
 
         let s: IpAddr = "10.0.0.0".parse().unwrap();
         let e: IpAddr = "10.255.255.255".parse().unwrap();
 
         // Broad range entry for 10.0.0.0/8
-        cache.insert_ip_background(
-            "ip:10.0.0.1".to_string(), &broad_rdap, Some((s, e)), 3600,
-        ).await.unwrap();
+        cache
+            .insert_ip_background("ip:10.0.0.1".to_string(), &broad_rdap, Some((s, e)), 3600)
+            .await
+            .unwrap();
 
         // Exact entry for 10.5.5.5
-        cache.insert_ip_background(
-            "ip:10.5.5.5".to_string(), &exact_rdap, None, 3600,
-        ).await.unwrap();
+        cache
+            .insert_ip_background("ip:10.5.5.5".to_string(), &exact_rdap, None, 3600)
+            .await
+            .unwrap();
 
         // 10.5.5.5 must return the exact entry, not the broad range entry
         let result = cache.get_ip("10.5.5.5".parse().unwrap()).unwrap().unwrap();
-        assert_eq!(result["name"], "EXACT-ENTRY",
-            "Exact key must take priority over a range match");
+        assert_eq!(
+            result["name"], "EXACT-ENTRY",
+            "Exact key must take priority over a range match"
+        );
+    }
+
+    /// When two cached ranges both contain the queried IP (a broad parent
+    /// allocation and a narrower reassigned block nested inside it), the
+    /// narrowest range must win — otherwise a query can silently return the
+    /// wrong (less specific) organization.
+    #[tokio::test]
+    async fn test_get_ip_narrowest_range_wins_over_broader_overlapping_range() {
+        let cache = open_mem();
+
+        let broad_rdap = json!({"name": "MICROSOFT-BROAD"});
+        let narrow_rdap = json!({"name": "CONTOSO-NARROW"});
+
+        // Broad parent allocation: 20.33.0.0 – 20.128.255.255
+        let broad_start: IpAddr = "20.33.0.0".parse().unwrap();
+        let broad_end: IpAddr = "20.128.255.255".parse().unwrap();
+        cache
+            .insert_ip_background(
+                "ip:20.59.128.0".to_string(),
+                &broad_rdap,
+                Some((broad_start, broad_end)),
+                3600,
+            )
+            .await
+            .unwrap();
+
+        // Narrower reassigned block nested inside it: 20.59.200.0 – 20.59.200.255
+        let narrow_start: IpAddr = "20.59.200.0".parse().unwrap();
+        let narrow_end: IpAddr = "20.59.200.255".parse().unwrap();
+        cache
+            .insert_ip_background(
+                "ip:20.59.200.5".to_string(),
+                &narrow_rdap,
+                Some((narrow_start, narrow_end)),
+                3600,
+            )
+            .await
+            .unwrap();
+
+        // 20.59.200.10 falls inside BOTH ranges but matches neither exact key —
+        // must return the narrower, more specific entry.
+        let result = cache
+            .get_ip("20.59.200.10".parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result["name"], "CONTOSO-NARROW",
+            "The narrowest containing range must win over a broader overlapping range"
+        );
     }
 
     /// Expired range entries must not be returned even when the range matches.
@@ -944,9 +1176,9 @@ mod tests {
 
         // Insert with a past timestamp (already expired)
         let start: IpAddr = "10.0.0.0".parse().unwrap();
-        let end:   IpAddr = "10.255.255.255".parse().unwrap();
+        let end: IpAddr = "10.255.255.255".parse().unwrap();
         {
-            let conn = cache.conn.lock().unwrap();
+            let conn = cache.conns[0].lock().unwrap();
             let past = unix_now() as i64 - 9999;
             let rs = ip_to_blob(start).to_vec();
             let re = ip_to_blob(end).to_vec();
@@ -961,12 +1193,15 @@ mod tests {
                     rs,
                     re
                 ],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Any IP in range — must be a miss because the entry is expired
-        assert!(cache.get_ip("10.5.5.5".parse().unwrap()).unwrap().is_none(),
-            "Expired range entry must not be returned");
+        assert!(
+            cache.get_ip("10.5.5.5".parse().unwrap()).unwrap().is_none(),
+            "Expired range entry must not be returned"
+        );
     }
 
     // ── ip_to_blob: IPv6 range containment ───────────────────────────────────
@@ -978,17 +1213,22 @@ mod tests {
 
         // Google's 2001:4860::/32 allocation
         let start: IpAddr = "2001:4860::".parse().unwrap();
-        let end:   IpAddr = "2001:4860:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
+        let end: IpAddr = "2001:4860:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
 
-        cache.insert_ip_background(
-            "ip:2001:4860:4860::8888".to_string(),
-            &rdap,
-            Some((start, end)),
-            86400,
-        ).await.unwrap();
+        cache
+            .insert_ip_background(
+                "ip:2001:4860:4860::8888".to_string(),
+                &rdap,
+                Some((start, end)),
+                86400,
+            )
+            .await
+            .unwrap();
 
         // Another address in the same /32 → hit
-        let hit = cache.get_ip("2001:4860:4860::8844".parse().unwrap()).unwrap();
+        let hit = cache
+            .get_ip("2001:4860:4860::8844".parse().unwrap())
+            .unwrap();
         assert!(hit.is_some(), "IPv6 range containment must work");
 
         // Address outside the range → miss

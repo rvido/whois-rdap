@@ -134,16 +134,16 @@ async fn refresh_file(
     url: &str,
     force: bool,
 ) -> Result<()> {
-    if !force && path.exists() {
-        if let Ok(meta) = std::fs::metadata(path) {
-            if let Ok(modified) = meta.modified() {
-                let age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or(Duration::MAX);
-                if age < Duration::from_secs(BOOTSTRAP_TTL_SECS) {
-                    return Ok(());
-                }
-            }
+    if !force
+        && path.exists()
+        && let Ok(meta) = std::fs::metadata(path)
+        && let Ok(modified) = meta.modified()
+    {
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or(Duration::MAX);
+        if age < Duration::from_secs(BOOTSTRAP_TTL_SECS) {
+            return Ok(());
         }
     }
 
@@ -204,7 +204,7 @@ fn parse_ipv6_bootstrap(data: &[u8]) -> Result<Vec<(Ipv6Net, Box<str>)>> {
             out.push((net, url.into()));
         }
     }
-    out.sort_by(|a, b| a.0.addr().cmp(&b.0.addr()));
+    out.sort_by_key(|(net, _)| net.addr());
     Ok(out)
 }
 

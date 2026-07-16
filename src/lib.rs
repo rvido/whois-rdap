@@ -21,6 +21,107 @@ pub(crate) fn install_ring_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// User-Agent header sent on all RDAP HTTP requests.
+pub const USER_AGENT: &str = "rdap-client/0.3 (Rust)";
+
+/// Build a `reqwest::Client` configured for RDAP use: shared user-agent,
+/// timeout, and one-time TLS crypto provider installation.
+///
+/// Callers that need their own `reqwest::Client` (e.g. for bootstrap
+/// downloads or bulk mode's shared connection pool) should use this instead
+/// of hand-rolling a builder, so the user-agent string and TLS setup never
+/// drift from `RdapClient::for_custom`'s.
+pub fn build_reqwest_client(timeout: Duration) -> Result<reqwest::Client> {
+    install_ring_provider();
+    Ok(reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(timeout)
+        .build()?)
+}
+
+/// A classified RDAP query target — an IP address, ASN, or domain name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryTarget {
+    Ip(IpAddr),
+    Domain(String),
+    Asn(u32),
+}
+
+/// Classify a raw query string into an IP, ASN, or Domain target.
+///
+/// Safe for any UTF-8 input: never slices a string at a fixed byte offset,
+/// so a query starting with a multi-byte character (e.g. an IDN label typed
+/// in native Unicode) cannot panic. Domain names are normalised to
+/// ASCII-lowercase so single-query and bulk lookups share cache keys.
+pub fn classify_query(s: &str) -> QueryTarget {
+    let trimmed = s.trim();
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return QueryTarget::Ip(ip);
+    }
+    let digits = strip_as_prefix(trimmed).unwrap_or(trimmed);
+    if !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && let Ok(asn) = digits.parse::<u32>()
+    {
+        return QueryTarget::Asn(asn);
+    }
+    QueryTarget::Domain(trimmed.to_ascii_lowercase())
+}
+
+/// If `s` begins with a case-insensitive "AS" prefix, returns the remainder
+/// after it; otherwise returns `None`.
+///
+/// Operates on `char`s rather than slicing at a fixed byte offset, so it
+/// never panics when the first character is multi-byte UTF-8.
+fn strip_as_prefix(s: &str) -> Option<&str> {
+    let mut chars = s.char_indices();
+    let (_, a) = chars.next()?;
+    let (i, b) = chars.next()?;
+    if (a == 'A' || a == 'a') && (b == 'S' || b == 's') {
+        Some(&s[i + b.len_utf8()..])
+    } else {
+        None
+    }
+}
+
+/// Resolve the RDAP base URL for a classified target, following the standard
+/// precedence: explicit `--server` > explicit `--rir` > IANA bootstrap
+/// triage > static per-target-kind default.
+///
+/// Shared by the single-query path and bulk mode so routing logic and
+/// ASN-prefix parsing can't drift between the two.
+pub fn resolve_base_url(
+    target: &QueryTarget,
+    explicit_server: Option<&str>,
+    explicit_rir: Option<RdapRegistry>,
+    bootstrap: Option<&bootstrap::BootstrapMap>,
+) -> String {
+    // 1. Explicit --server wins
+    if let Some(s) = explicit_server {
+        return s.to_string();
+    }
+    // 2. Explicit --rir wins
+    if let Some(reg) = explicit_rir {
+        return reg.base_url().to_string();
+    }
+    // 3. Bootstrap triage
+    if let Some(map) = bootstrap {
+        let found = match target {
+            QueryTarget::Ip(ip) => map.find_ip(*ip),
+            QueryTarget::Asn(asn) => map.find_asn(*asn),
+            QueryTarget::Domain(_) => None, // Domain bootstrap not in scope
+        };
+        if let Some(url) = found {
+            return url.to_string();
+        }
+    }
+    // 4. Static defaults
+    match target {
+        QueryTarget::Ip(_) => RdapRegistry::RIPE.base_url().to_string(),
+        QueryTarget::Domain(_) | QueryTarget::Asn(_) => RdapRegistry::IANA.base_url().to_string(),
+    }
+}
+
 /// Resolve the default base cache directory for the process, accounting for
 /// custom environments, missing/fallback HOME, or embedded devices.
 pub(crate) fn default_cache_base() -> Result<std::path::PathBuf> {
@@ -37,10 +138,7 @@ pub(crate) fn default_cache_base() -> Result<std::path::PathBuf> {
     // 2. Check HOME env var.
     if let Some(home) = std::env::var_os("HOME") {
         let home_path = PathBuf::from(home);
-        if !home_path.as_os_str().is_empty()
-            && home_path != PathBuf::from("/root")
-            && home_path != PathBuf::from("/")
-        {
+        if !home_path.as_os_str().is_empty() && home_path != *"/root" && home_path != *"/" {
             return Ok(home_path.join(".cache").join("whois-rdap"));
         }
     }
@@ -49,7 +147,6 @@ pub(crate) fn default_cache_base() -> Result<std::path::PathBuf> {
     // std::env::temp_dir() is universally writable and available (e.g. /tmp on Linux).
     Ok(std::env::temp_dir().join("whois-rdap"))
 }
-
 
 /// Well-known RDAP registries (RIRs + IANA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,15 +308,10 @@ impl RdapClient {
 
     /// Construct a client for a custom server URL (e.g., internal mirror).
     pub fn for_custom(base_url: &str, timeout: Duration) -> Result<Self> {
-        // Install the ring crypto provider (idempotent — safe to call repeatedly).
-        install_ring_provider();
         let base_trimmed = trim_trailing_slash(base_url);
         let base = reqwest::Url::parse(base_trimmed)
             .map_err(|e| anyhow!("Invalid base URL '{}': {}", base_url, e))?;
-        let http = reqwest::Client::builder()
-            .user_agent("rdap-client/0.1 (Rust)")
-            .timeout(timeout)
-            .build()?;
+        let http = build_reqwest_client(timeout)?;
         Ok(Self { http, base })
     }
 
@@ -271,7 +363,10 @@ impl RdapClient {
             ));
         }
 
-        let bytes = resp.bytes().await.context("Failed to read response bytes")?;
+        let bytes = resp
+            .bytes()
+            .await
+            .context("Failed to read response bytes")?;
         let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
         let organization = extract_org(&json);
         let country_code = extract_country_code(&json);
@@ -318,7 +413,10 @@ impl RdapClient {
             ));
         }
 
-        let bytes = resp.bytes().await.context("Failed to read response bytes")?;
+        let bytes = resp
+            .bytes()
+            .await
+            .context("Failed to read response bytes")?;
         let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
         let handle = json
             .get("ldhName")
@@ -372,7 +470,10 @@ impl RdapClient {
             ));
         }
 
-        let bytes = resp.bytes().await.context("Failed to read response bytes")?;
+        let bytes = resp
+            .bytes()
+            .await
+            .context("Failed to read response bytes")?;
         let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
         let organization = extract_org(&json);
         let country_code = extract_country_code(&json);

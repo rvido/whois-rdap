@@ -9,13 +9,14 @@
 // Target strings are parsed lazily from the iterator; the caller owns the
 // buffering strategy (file lines, stdin, argv).
 
-use crate::{RdapAsnResult, RdapClient, RdapDomainResult, RdapResult};
+use crate::{QueryTarget, RdapAsnResult, RdapClient, RdapDomainResult, RdapResult, classify_query};
 use anyhow::Result;
 use futures::StreamExt;
 use serde_json::Value;
 use std::io::Write;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 /// In-flight query state for SingleFlight request collapsing.
@@ -37,9 +38,12 @@ pub struct BulkContext {
     pub cache_ttl_asn: u64,
     pub server: Option<String>,
     pub rir: Option<crate::RdapRegistry>,
-    pub active_queries: tokio::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::watch::Sender<QueryState>>
-    >,
+    /// Plain `std::sync::Mutex` (not `tokio::sync::Mutex`): every critical
+    /// section here is a quick HashMap operation with no `.await` inside it,
+    /// so a synchronous lock is safe and lets `ActiveQueryGuard`'s `Drop`
+    /// impl clean up orphaned entries on task cancellation (Drop can't await).
+    pub active_queries:
+        StdMutex<std::collections::HashMap<String, tokio::sync::watch::Sender<QueryState>>>,
 }
 
 /// One resolved RDAP result (tagged union).
@@ -57,7 +61,7 @@ impl BulkRecord {
             BulkRecord::Ip(target, r) => serde_json::to_vec(&serde_json::json!({
                 "query": target,
                 "type": "ip",
-                "organization": r.organization,
+                "organization": r.organization.as_deref().unwrap_or("Unknown"),
                 "country_code": r.country_code,
                 "cidrs": r.cidrs,
                 "as_number": r.as_number,
@@ -68,7 +72,7 @@ impl BulkRecord {
                 "query": target,
                 "type": "domain",
                 "handle": r.handle,
-                "organization": r.organization,
+                "organization": r.organization.as_deref().unwrap_or("Unknown"),
                 "registrar": r.registrar,
                 "country_code": r.country_code,
                 "nameservers": r.nameservers,
@@ -79,7 +83,7 @@ impl BulkRecord {
             BulkRecord::Asn(asn, r) => serde_json::to_vec(&serde_json::json!({
                 "query": format!("AS{asn}"),
                 "type": "asn",
-                "organization": r.organization,
+                "organization": r.organization.as_deref().unwrap_or("Unknown"),
                 "country_code": r.country_code,
                 "range": r.range.map(|(s, e)| format!("AS{s}-AS{e}")),
             }))
@@ -92,32 +96,6 @@ impl BulkRecord {
             .unwrap_or_default(),
         }
     }
-}
-
-// ── Query type detection (mirrors main.rs, kept local to avoid coupling) ─────
-
-enum Target {
-    Ip(std::net::IpAddr),
-    Domain(String),
-    Asn(u32),
-}
-
-fn parse_target(s: &str) -> Target {
-    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-        return Target::Ip(ip);
-    }
-    let trimmed = s.trim();
-    let digits = if trimmed.len() > 2 && trimmed[..2].eq_ignore_ascii_case("AS") {
-        &trimmed[2..]
-    } else {
-        trimmed
-    };
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        if let Ok(n) = digits.parse::<u32>() {
-            return Target::Asn(n);
-        }
-    }
-    Target::Domain(trimmed.to_ascii_lowercase())
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -160,17 +138,53 @@ where
 
 impl BulkContext {
     /// Finish an active query by sending its result to all waiters and removing it from the map.
-    pub async fn finish_query(&self, key: &str, result: (String, Result<Value, String>)) {
-        let mut active = self.active_queries.lock().await;
+    pub fn finish_query(&self, key: &str, result: (String, Result<Value, String>)) {
+        let mut active = self
+            .active_queries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = active.remove(key) {
             let _ = tx.send(QueryState::Ready(result));
         }
     }
 }
 
-fn get_group_key(target: &Target) -> String {
+/// RAII cleanup for a SingleFlight initiator's entry in `active_queries`.
+///
+/// `lookup_one` normally removes its own entry via `BulkContext::finish_query`
+/// once the network lookup completes. But if the enclosing task is dropped
+/// before that point (e.g. a library caller wraps `bulk_lookup` in
+/// `tokio::select!`/`tokio::time::timeout`), `finish_query` never runs, and
+/// the orphaned `watch::Sender` would leave every future query for the same
+/// group key waiting on `rx.changed()` forever. This guard is created only
+/// by the initiator (the task that inserted the entry) and, on drop, removes
+/// the entry and wakes any waiters with an error result so they fall back to
+/// their own network lookup instead of hanging. If `finish_query` already
+/// ran, the entry is already gone and this is a no-op.
+struct ActiveQueryGuard<'a> {
+    ctx: &'a BulkContext,
+    key: String,
+}
+
+impl<'a> Drop for ActiveQueryGuard<'a> {
+    fn drop(&mut self) {
+        let mut active = self
+            .ctx
+            .active_queries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = active.remove(&self.key) {
+            let _ = tx.send(QueryState::Ready((
+                self.key.clone(),
+                Err("query cancelled before completion".to_string()),
+            )));
+        }
+    }
+}
+
+fn get_group_key(target: &QueryTarget) -> String {
     match target {
-        Target::Ip(ip) => match ip {
+        QueryTarget::Ip(ip) => match ip {
             IpAddr::V4(ipv4) => {
                 let octets = ipv4.octets();
                 // Group by /16 to collapse queries within the same broad provider block
@@ -179,43 +193,46 @@ fn get_group_key(target: &Target) -> String {
             IpAddr::V6(ipv6) => {
                 let segments = ipv6.segments();
                 // Group by /48 for IPv6
-                format!("group:ipv6:{:x}:{:x}:{:x}", segments[0], segments[1], segments[2])
+                format!(
+                    "group:ipv6:{:x}:{:x}:{:x}",
+                    segments[0], segments[1], segments[2]
+                )
             }
         },
-        Target::Domain(domain) => {
+        QueryTarget::Domain(domain) => {
             format!("group:domain:{}", domain)
         }
-        Target::Asn(asn) => {
+        QueryTarget::Asn(asn) => {
             format!("group:asn:{}", asn)
         }
     }
 }
 
 async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
-    let target = parse_target(&raw);
+    let target = classify_query(&raw);
     let cache_key = match &target {
-        Target::Ip(ip) => crate::cache::key_ip(ip),
-        Target::Domain(domain) => crate::cache::key_domain(domain),
-        Target::Asn(asn) => crate::cache::key_asn(*asn),
+        QueryTarget::Ip(ip) => crate::cache::key_ip(ip),
+        QueryTarget::Domain(domain) => crate::cache::key_domain(domain),
+        QueryTarget::Asn(asn) => crate::cache::key_asn(*asn),
     };
     let group_key = get_group_key(&target);
 
     // 1. Cache hit path (IP range-aware, domain/ASN exact match)
     if let Some(ref cache) = ctx.cache {
         match &target {
-            Target::Ip(ip) => {
+            QueryTarget::Ip(ip) => {
                 if let Ok(Some(cached)) = cache.get_ip(*ip) {
                     let res = crate::parse_ip_response(cached);
                     return BulkRecord::Ip(raw, res);
                 }
             }
-            Target::Domain(domain) => {
+            QueryTarget::Domain(domain) => {
                 if let Ok(Some(cached)) = cache.get(&cache_key) {
                     let res = crate::parse_domain_response(domain, cached);
                     return BulkRecord::Domain(raw, res);
                 }
             }
-            Target::Asn(asn) => {
+            QueryTarget::Asn(asn) => {
                 if let Ok(Some(cached)) = cache.get(&cache_key) {
                     let res = crate::parse_asn_response(*asn, cached);
                     return BulkRecord::Asn(*asn, res);
@@ -226,7 +243,7 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
 
     // 2. Check/Register in-flight request (SingleFlight collapsing by prefix group key)
     let rx = {
-        let mut active = ctx.active_queries.lock().await;
+        let mut active = ctx.active_queries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = active.get(&group_key) {
             Some(tx.subscribe())
         } else {
@@ -236,6 +253,14 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         }
     };
 
+    // Only the initiator (the task that just inserted the map entry) owns a
+    // cleanup guard — if this task is cancelled before finish_query runs,
+    // the guard's Drop impl removes the orphaned entry and unblocks waiters.
+    let _guard = rx.is_none().then(|| ActiveQueryGuard {
+        ctx,
+        key: group_key.clone(),
+    });
+
     if let Some(mut rx) = rx {
         // We are a waiter. Wait for the initiator to complete.
         loop {
@@ -243,13 +268,23 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
                 // If it's an exact target match, we reuse the initiator's result (success or failure) directly.
                 if cache_key == *initiator_key {
                     match res {
-                        Ok(val) => {
-                            match &target {
-                                Target::Ip(_) => return BulkRecord::Ip(raw, crate::parse_ip_response(val.clone())),
-                                Target::Domain(domain) => return BulkRecord::Domain(raw, crate::parse_domain_response(domain, val.clone())),
-                                Target::Asn(asn) => return BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, val.clone())),
+                        Ok(val) => match &target {
+                            QueryTarget::Ip(_) => {
+                                return BulkRecord::Ip(raw, crate::parse_ip_response(val.clone()));
                             }
-                        }
+                            QueryTarget::Domain(domain) => {
+                                return BulkRecord::Domain(
+                                    raw,
+                                    crate::parse_domain_response(domain, val.clone()),
+                                );
+                            }
+                            QueryTarget::Asn(asn) => {
+                                return BulkRecord::Asn(
+                                    *asn,
+                                    crate::parse_asn_response(*asn, val.clone()),
+                                );
+                            }
+                        },
                         Err(err) => {
                             return BulkRecord::Error(raw, err.clone());
                         }
@@ -258,29 +293,32 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
 
                 // The initiator completed successfully. Re-check the database cache
                 // to see if the returned range (or exact match) covers our IP.
-                match res {
-                    Ok(_) => {
-                        if let Some(ref cache) = ctx.cache {
-                            match &target {
-                                Target::Ip(ip) => {
-                                    if let Ok(Some(cached)) = cache.get_ip(*ip) {
-                                        return BulkRecord::Ip(raw, crate::parse_ip_response(cached));
-                                    }
-                                }
-                                Target::Domain(domain) => {
-                                    if let Ok(Some(cached)) = cache.get(&cache_key) {
-                                        return BulkRecord::Domain(raw, crate::parse_domain_response(domain, cached));
-                                    }
-                                }
-                                Target::Asn(asn) => {
-                                    if let Ok(Some(cached)) = cache.get(&cache_key) {
-                                        return BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, cached));
-                                    }
-                                }
+                if res.is_ok()
+                    && let Some(ref cache) = ctx.cache
+                {
+                    match &target {
+                        QueryTarget::Ip(ip) => {
+                            if let Ok(Some(cached)) = cache.get_ip(*ip) {
+                                return BulkRecord::Ip(raw, crate::parse_ip_response(cached));
+                            }
+                        }
+                        QueryTarget::Domain(domain) => {
+                            if let Ok(Some(cached)) = cache.get(&cache_key) {
+                                return BulkRecord::Domain(
+                                    raw,
+                                    crate::parse_domain_response(domain, cached),
+                                );
+                            }
+                        }
+                        QueryTarget::Asn(asn) => {
+                            if let Ok(Some(cached)) = cache.get(&cache_key) {
+                                return BulkRecord::Asn(
+                                    *asn,
+                                    crate::parse_asn_response(*asn, cached),
+                                );
                             }
                         }
                     }
-                    Err(_) => {}
                 }
                 // If it's still a cache miss (e.g. they are in different allocations in the same /16),
                 // break out and proceed to execute our own network query.
@@ -293,18 +331,23 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
     }
 
     // 3. We are the initiator (or waiter whose leader range didn't cover us) -> network lookup
-    let base_url = resolve_base_url(ctx, &target);
+    let base_url = crate::resolve_base_url(
+        &target,
+        ctx.server.as_deref(),
+        ctx.rir,
+        ctx.bootstrap.as_deref(),
+    );
     let client = match RdapClient::for_custom_with_client(&base_url, ctx.http.clone()) {
         Ok(c) => c,
         Err(e) => {
             let err_msg = e.to_string();
-            ctx.finish_query(&group_key, (cache_key.clone(), Err(err_msg.clone()))).await;
+            ctx.finish_query(&group_key, (cache_key.clone(), Err(err_msg.clone())));
             return BulkRecord::Error(raw, err_msg);
         }
     };
 
-    let result = match target {
-        Target::Ip(ip) => match client.lookup_ip(ip).await {
+    let result = match &target {
+        QueryTarget::Ip(ip) => match client.lookup_ip(*ip).await {
             Ok(res) => {
                 // Follow redirects
                 let followed =
@@ -315,41 +358,56 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
                 } else {
                     res
                 };
-                // Write cache
+                // Write cache — awaited so the write has landed before we
+                // broadcast completion (step 5), otherwise waiters that
+                // re-check the cache immediately after being woken can race
+                // ahead of this still-in-flight spawn_blocking write and see
+                // a spurious miss.
                 if let Some(ref cache) = ctx.cache {
                     let range_bounds = res.range.as_ref().and_then(|(s, e)| {
                         Some((s.parse::<IpAddr>().ok()?, e.parse::<IpAddr>().ok()?))
                     });
-                    cache.insert_ip_background(cache_key.clone(), &res.raw, range_bounds, ctx.cache_ttl_ip);
+                    let _ = cache
+                        .insert_ip_background(
+                            cache_key.clone(),
+                            &res.raw,
+                            range_bounds,
+                            ctx.cache_ttl_ip,
+                        )
+                        .await;
                 }
                 Ok(res.raw)
             }
             Err(e) => Err(e.to_string()),
         },
-        Target::Domain(domain) => match client.lookup_domain(&domain).await {
+        QueryTarget::Domain(domain) => match client.lookup_domain(domain).await {
             Ok(res) => {
                 // Follow redirects
                 let followed =
                     crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
                         .await;
                 let res = if followed != res.raw {
-                    crate::parse_domain_response(&domain, followed)
+                    crate::parse_domain_response(domain, followed)
                 } else {
                     res
                 };
-                // Write cache
+                // Write cache — awaited, see comment above.
                 if let Some(ref cache) = ctx.cache {
-                    cache.insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_domain);
+                    let _ = cache
+                        .insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_domain)
+                        .await;
                 }
                 Ok(res.raw)
             }
             Err(e) => Err(e.to_string()),
         },
-        Target::Asn(asn) => match client.lookup_asn(asn).await {
+        QueryTarget::Asn(asn) => match client.lookup_asn(*asn).await {
             Ok(res) => {
-                // Write cache
+                // Write cache — awaited, see comment above.
                 if let Some(ref cache) = ctx.cache {
-                    cache.insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_asn);
+                    let _ = cache
+                        .insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_asn)
+                        .await;
                 }
                 Ok(res.raw)
             }
@@ -359,45 +417,22 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
 
     // 4. Resolve our own return value
     let record = match &result {
-        Ok(val) => match &parse_target(&raw) {
-            Target::Ip(_) => BulkRecord::Ip(raw, crate::parse_ip_response(val.clone())),
-            Target::Domain(domain) => BulkRecord::Domain(raw, crate::parse_domain_response(domain, val.clone())),
-            Target::Asn(asn) => BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, val.clone())),
+        Ok(val) => match &target {
+            QueryTarget::Ip(_) => BulkRecord::Ip(raw, crate::parse_ip_response(val.clone())),
+            QueryTarget::Domain(domain) => {
+                BulkRecord::Domain(raw, crate::parse_domain_response(domain, val.clone()))
+            }
+            QueryTarget::Asn(asn) => {
+                BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, val.clone()))
+            }
         },
         Err(err) => BulkRecord::Error(raw, err.clone()),
     };
 
     // 5. Broadcast to waiters and clean up active map
-    ctx.finish_query(&group_key, (cache_key, result)).await;
+    ctx.finish_query(&group_key, (cache_key, result));
 
     record
-}
-
-fn resolve_base_url(ctx: &BulkContext, target: &Target) -> String {
-    // 1. Explicit --server wins
-    if let Some(ref s) = ctx.server {
-        return s.clone();
-    }
-    // 2. Explicit --rir wins
-    if let Some(reg) = ctx.rir {
-        return reg.base_url().to_string();
-    }
-    // 3. Bootstrap triage
-    if let Some(ref map) = ctx.bootstrap {
-        let found = match target {
-            Target::Ip(ip) => map.find_ip(*ip),
-            Target::Asn(asn) => map.find_asn(*asn),
-            Target::Domain(_) => None, // Domain bootstrap not in scope
-        };
-        if let Some(url) = found {
-            return url.to_string();
-        }
-    }
-    // 4. Static defaults
-    match target {
-        Target::Ip(_) => crate::RdapRegistry::RIPE.base_url().to_string(),
-        Target::Domain(_) | Target::Asn(_) => crate::RdapRegistry::IANA.base_url().to_string(),
-    }
 }
 
 // ── Helper: read targets from a file or stdin ─────────────────────────────────
@@ -434,9 +469,15 @@ async fn collect_lines<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Re
         if n == 0 {
             break;
         }
-        let trimmed = buf.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            lines.push(trimmed.to_string());
+        // Strip both whole-line comments ("# ...") and inline trailing
+        // comments ("1.1.1.1  # Cloudflare"), per the documented targets
+        // file format — target strings never legitimately contain '#'.
+        let line = buf.trim();
+        let target = line
+            .split_once('#')
+            .map_or(line, |(before, _)| before.trim());
+        if !target.is_empty() {
+            lines.push(target.to_string());
         }
     }
     Ok(lines)
@@ -586,61 +627,80 @@ mod tests {
         );
     }
 
-    // ── parse_target detection ────────────────────────────────────────────────
+    // ── classify_query detection (shared with main.rs, see lib.rs) ────────────
 
     #[test]
-    fn test_parse_target_ip() {
+    fn test_classify_query_ip() {
         assert!(matches!(
-            parse_target("8.8.8.8"),
-            Target::Ip(ip) if ip.to_string() == "8.8.8.8"
+            classify_query("8.8.8.8"),
+            QueryTarget::Ip(ip) if ip.to_string() == "8.8.8.8"
         ));
     }
 
     #[test]
-    fn test_parse_target_ipv6() {
+    fn test_classify_query_ipv6() {
         assert!(matches!(
-            parse_target("2001:4860:4860::8888"),
-            Target::Ip(_)
+            classify_query("2001:4860:4860::8888"),
+            QueryTarget::Ip(_)
         ));
     }
 
     #[test]
-    fn test_parse_target_asn_prefix() {
-        assert!(matches!(parse_target("AS15169"), Target::Asn(15169)));
+    fn test_classify_query_asn_prefix() {
+        assert!(matches!(classify_query("AS15169"), QueryTarget::Asn(15169)));
     }
 
     #[test]
-    fn test_parse_target_asn_prefix_lowercase() {
-        // "as" prefix should also work (case-insensitive check in parse_target)
-        assert!(matches!(parse_target("as15169"), Target::Asn(15169)));
+    fn test_classify_query_asn_prefix_lowercase() {
+        // "as" prefix should also work (case-insensitive check)
+        assert!(matches!(classify_query("as15169"), QueryTarget::Asn(15169)));
     }
 
     #[test]
-    fn test_parse_target_asn_bare() {
-        assert!(matches!(parse_target("15169"), Target::Asn(15169)));
+    fn test_classify_query_asn_bare() {
+        assert!(matches!(classify_query("15169"), QueryTarget::Asn(15169)));
     }
 
     #[test]
-    fn test_parse_target_domain() {
+    fn test_classify_query_domain() {
         assert!(matches!(
-            parse_target("google.com"),
-            Target::Domain(d) if d == "google.com"
+            classify_query("google.com"),
+            QueryTarget::Domain(d) if d == "google.com"
         ));
     }
 
     #[test]
-    fn test_parse_target_domain_normalised_to_lowercase() {
-        // parse_target normalises domains to ascii-lowercase
+    fn test_classify_query_domain_normalised_to_lowercase() {
         assert!(matches!(
-            parse_target("GOOGLE.COM"),
-            Target::Domain(d) if d == "google.com"
+            classify_query("GOOGLE.COM"),
+            QueryTarget::Domain(d) if d == "google.com"
         ));
     }
 
     #[test]
-    fn test_parse_target_empty_string_is_domain() {
+    fn test_classify_query_empty_string_is_domain() {
         // Degenerate input: empty string is classified as Domain (not panicking)
-        assert!(matches!(parse_target(""), Target::Domain(_)));
+        assert!(matches!(classify_query(""), QueryTarget::Domain(_)));
+    }
+
+    #[test]
+    fn test_classify_query_multibyte_leading_char_does_not_panic() {
+        // Regression: byte-slicing at a fixed offset (old bug) panicked on
+        // any query whose first character is multi-byte UTF-8.
+        assert!(matches!(
+            classify_query("日本語.jp"),
+            QueryTarget::Domain(_)
+        ));
+        assert!(matches!(classify_query("İstanbul"), QueryTarget::Domain(_)));
+    }
+
+    #[test]
+    fn test_classify_query_trims_leading_whitespace_before_as_prefix() {
+        // Regression: a leading space must not defeat "AS" prefix stripping.
+        assert!(matches!(
+            classify_query(" AS15169"),
+            QueryTarget::Asn(15169)
+        ));
     }
 
     // ── collect_lines (blank/comment skipping) ────────────────────────────────
@@ -654,6 +714,18 @@ mod tests {
         let lines = collect_lines(&mut reader).await.unwrap();
 
         assert_eq!(lines, vec!["8.8.8.8", "AS15169", "google.com"]);
+    }
+
+    #[tokio::test]
+    async fn test_collect_lines_strips_inline_trailing_comments() {
+        // README documents "1.1.1.1     # Cloudflare" as valid syntax — the
+        // trailing comment must be stripped, not treated as part of the target.
+        let input = b"1.1.1.1     # Cloudflare\nAS15169 # Google\ngoogle.com\n";
+        let reader = tokio::io::BufReader::new(&input[..]);
+        tokio::pin!(reader);
+        let lines = collect_lines(&mut reader).await.unwrap();
+
+        assert_eq!(lines, vec!["1.1.1.1", "AS15169", "google.com"]);
     }
 
     #[tokio::test]
@@ -743,7 +815,7 @@ mod tests {
             cache_ttl_asn: 3600,
             server: Some("http://127.0.0.1:1".to_string()),
             rir: None,
-            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            active_queries: StdMutex::new(std::collections::HashMap::new()),
         });
 
         let targets = vec![
@@ -799,18 +871,13 @@ mod tests {
             cache_ttl_asn: 3600,
             server: Some("http://127.0.0.1:1".to_string()),
             rir: None,
-            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            active_queries: StdMutex::new(std::collections::HashMap::new()),
         });
 
         let mut output = Vec::<u8>::new();
-        bulk_lookup(
-            ctx,
-            std::iter::once("8.8.8.8".to_string()),
-            1,
-            &mut output,
-        )
-        .await
-        .unwrap();
+        bulk_lookup(ctx, std::iter::once("8.8.8.8".to_string()), 1, &mut output)
+            .await
+            .unwrap();
 
         assert!(
             output.ends_with(b"\n"),
@@ -836,7 +903,7 @@ mod tests {
             cache_ttl_asn: 3600,
             server: Some("http://127.0.0.1:1".to_string()),
             rir: None,
-            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            active_queries: StdMutex::new(std::collections::HashMap::new()),
         });
 
         let mut output = Vec::<u8>::new();
@@ -862,7 +929,9 @@ mod tests {
                 conn_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Send a dummy HTTP 404 response to satisfy the reqwest client
                 use tokio::io::AsyncWriteExt;
-                let _ = socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await;
             }
         });
 
@@ -881,16 +950,22 @@ mod tests {
             cache_ttl_asn: 3600,
             server: Some(format!("http://{}", addr)),
             rir: None,
-            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            active_queries: StdMutex::new(std::collections::HashMap::new()),
         });
 
         // 10 duplicate queries running with high concurrency
         let targets = vec!["8.8.8.8".to_string(); 10];
         let mut output = Vec::<u8>::new();
-        bulk_lookup(ctx, targets.into_iter(), 10, &mut output).await.unwrap();
+        bulk_lookup(ctx, targets.into_iter(), 10, &mut output)
+            .await
+            .unwrap();
 
         // The connections accepted by our TCP listener must be exactly 1!
         let count = conn_count.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(count, 1, "Expected exactly 1 network query due to SingleFlight collapsing, but got {}", count);
+        assert_eq!(
+            count, 1,
+            "Expected exactly 1 network query due to SingleFlight collapsing, but got {}",
+            count
+        );
     }
 }

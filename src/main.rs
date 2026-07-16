@@ -1,7 +1,7 @@
 // A command-line tool to query RDAP servers for IP, Domain, and ASN information.
 // Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::{ArgGroup, Parser, ValueHint};
 
 use std::io::Write;
@@ -9,10 +9,12 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use whois_rdap::{
-    RdapClient, RdapRegistry,
+    QueryTarget, RdapClient, RdapRegistry, build_reqwest_client,
     bulk::{bulk_lookup, read_targets_file},
     cache::{Cache, key_asn, key_domain, key_ip},
+    classify_query,
     redirect::follow_links,
+    resolve_base_url,
 };
 
 // ── CLI definition ─────────────────────────────────────────────────────────
@@ -100,43 +102,6 @@ struct Args {
     max_redirects: u8,
 }
 
-// ── Query type ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryType {
-    Ip,
-    Domain,
-    Asn,
-}
-
-fn detect_query_type(query: &str) -> QueryType {
-    if query.parse::<IpAddr>().is_ok() {
-        return QueryType::Ip;
-    }
-    let trimmed = query.trim();
-    let digits = if trimmed.len() > 2 && trimmed[..2].eq_ignore_ascii_case("AS") {
-        &trimmed[2..]
-    } else {
-        trimmed
-    };
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        return QueryType::Asn;
-    }
-    QueryType::Domain
-}
-
-fn parse_query_asn(query: &str) -> Result<u32> {
-    let trimmed = query.trim();
-    let digits = if trimmed.len() > 2 && trimmed[..2].eq_ignore_ascii_case("AS") {
-        &trimmed[2..]
-    } else {
-        trimmed
-    };
-    digits
-        .parse::<u32>()
-        .map_err(|_| anyhow!("Invalid AS number: '{}'", query))
-}
-
 // ── Entry point ────────────────────────────────────────────────────────────
 
 #[tokio::main(flavor = "current_thread")]
@@ -181,7 +146,7 @@ async fn main() -> Result<()> {
     // For single queries we resolve it here.
     let bootstrap_map = if !args.no_bootstrap && args.server.is_none() && args.rir.is_none() {
         // Build a minimal reqwest client for bootstrap download only.
-        let boot_http = build_http_client(timeout)?;
+        let boot_http = build_reqwest_client(timeout)?;
         match whois_rdap::bootstrap::BootstrapMap::load(&boot_http, args.refresh_bootstrap).await {
             Ok(map) => Some(Arc::new(map)),
             Err(e) => {
@@ -197,7 +162,7 @@ async fn main() -> Result<()> {
 
     // ── Multi-target: bulk mode ────────────────────────────────────────────
     if targets.len() > 1 || args.file.is_some() {
-        let http = build_http_client(timeout)?;
+        let http = build_reqwest_client(timeout)?;
         let ctx = Arc::new(whois_rdap::bulk::BulkContext {
             http,
             cache,
@@ -209,7 +174,7 @@ async fn main() -> Result<()> {
             cache_ttl_asn: args.cache_ttl_asn,
             server: args.server.clone(),
             rir: args.rir,
-            active_queries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            active_queries: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let mut writer = stdout.lock();
         bulk_lookup(ctx, targets.into_iter(), args.concurrency, &mut writer).await?;
@@ -218,30 +183,32 @@ async fn main() -> Result<()> {
 
     // ── Single query ───────────────────────────────────────────────────────
     let query = &targets[0];
-    let query_type = detect_query_type(query);
-    let base_url = resolve_base_url(&args, Some(query), &bootstrap_map, query_type);
+    let target = classify_query(query);
+    let base_url = resolve_base_url(
+        &target,
+        args.server.as_deref(),
+        args.rir,
+        bootstrap_map.as_deref(),
+    );
     let client = RdapClient::for_custom(&base_url, timeout)?;
     let max_redirects = args.max_redirects.min(3);
 
     let mut handle = stdout.lock();
 
-    match query_type {
-        QueryType::Ip => {
-            let ip: IpAddr = query
-                .parse()
-                .map_err(|_| anyhow!("Invalid IP address: {}", query))?;
+    match target {
+        QueryTarget::Ip(ip) => {
             let cache_key = key_ip(&ip);
             let ttl = args.cache_ttl_ip;
 
             // Cache read — range-aware: any IP within a previously cached
             // RDAP allocation (e.g. 20.33.0.0–20.128.255.255) hits here
             // without a network round-trip, even for a different IP in that range.
-            if let Some(ref c) = cache {
-                if let Ok(Some(cached)) = c.get_ip(ip) {
-                    let res = whois_rdap::parse_ip_response(cached);
-                    print_ip_result(&mut handle, ip, &base_url, &res, args.json)?;
-                    return Ok(());
-                }
+            if let Some(ref c) = cache
+                && let Ok(Some(cached)) = c.get_ip(ip)
+            {
+                let res = whois_rdap::parse_ip_response(cached);
+                print_ip_result(&mut handle, ip, &base_url, &res, args.json)?;
+                return Ok(());
             }
 
             match client.lookup_ip(ip).await {
@@ -272,17 +239,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        QueryType::Domain => {
-            let domain = query.to_ascii_lowercase();
+        QueryTarget::Domain(domain) => {
             let cache_key = key_domain(&domain);
             let ttl = args.cache_ttl_domain;
 
-            if let Some(ref c) = cache {
-                if let Ok(Some(cached)) = c.get(&cache_key) {
-                    let res = whois_rdap::parse_domain_response(&domain, cached);
-                    print_domain_result(&mut handle, &base_url, &res, args.json)?;
-                    return Ok(());
-                }
+            if let Some(ref c) = cache
+                && let Ok(Some(cached)) = c.get(&cache_key)
+            {
+                let res = whois_rdap::parse_domain_response(&domain, cached);
+                print_domain_result(&mut handle, &base_url, &res, args.json)?;
+                return Ok(());
             }
 
             match client.lookup_domain(&domain).await {
@@ -303,17 +269,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        QueryType::Asn => {
-            let asn = parse_query_asn(query)?;
+        QueryTarget::Asn(asn) => {
             let cache_key = key_asn(asn);
             let ttl = args.cache_ttl_asn;
 
-            if let Some(ref c) = cache {
-                if let Ok(Some(cached)) = c.get(&cache_key) {
-                    let res = whois_rdap::parse_asn_response(asn, cached);
-                    print_asn_result(&mut handle, &base_url, &res, args.json)?;
-                    return Ok(());
-                }
+            if let Some(ref c) = cache
+                && let Ok(Some(cached)) = c.get(&cache_key)
+            {
+                let res = whois_rdap::parse_asn_response(asn, cached);
+                print_asn_result(&mut handle, &base_url, &res, args.json)?;
+                return Ok(());
             }
 
             match client.lookup_asn(asn).await {
@@ -331,63 +296,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ── URL resolution ─────────────────────────────────────────────────────────
-
-fn resolve_base_url(
-    args: &Args,
-    query: Option<&str>,
-    bootstrap: &Option<Arc<whois_rdap::bootstrap::BootstrapMap>>,
-    query_type: QueryType,
-) -> String {
-    // 1. Explicit --server wins
-    if let Some(ref s) = args.server {
-        return s.clone();
-    }
-    // 2. Explicit --rir wins
-    if let Some(reg) = args.rir {
-        return reg.base_url().to_string();
-    }
-    // 3. Bootstrap triage
-    if let (Some(map), Some(q)) = (bootstrap, query) {
-        let found = match query_type {
-            QueryType::Ip => q.parse::<IpAddr>().ok().and_then(|ip| map.find_ip(ip)),
-            QueryType::Asn => {
-                let digits = if q.len() > 2 && q[..2].eq_ignore_ascii_case("AS") {
-                    &q[2..]
-                } else {
-                    q
-                };
-                digits.parse::<u32>().ok().and_then(|asn| map.find_asn(asn))
-            }
-            QueryType::Domain => None, // Domain bootstrap not in scope
-        };
-        if let Some(url) = found {
-            return url.to_string();
-        }
-    }
-    // 4. Static defaults
-    match query_type {
-        QueryType::Ip => RdapRegistry::RIPE.base_url().to_string(),
-        QueryType::Domain | QueryType::Asn => RdapRegistry::IANA.base_url().to_string(),
-    }
-}
-
-fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
-    // Install ring provider (idempotent — RdapClient::for_custom does the same).
-    // We reach into the lib's bootstrap loader via a temporary RdapClient to
-    // avoid duplicating the ring installation logic.
-    // Use a throwaway RdapClient just to trigger ring installation.
-    let _ = RdapClient::for_custom("https://rdap.iana.org", timeout)?;
-    Ok(reqwest::Client::builder()
-        .user_agent("rdap-client/0.3 (Rust)")
-        .timeout(timeout)
-        .build()?)
-}
-
-// (Broken rebuild helpers removed — use whois_rdap::parse_ip_response,
-//  parse_domain_response, and parse_asn_response from lib.rs instead.
-//  Those call the real RDAP extractors rather than reading fake keys.)
-
 // ── Print helpers ──────────────────────────────────────────────────────────
 
 fn print_ip_result<W: Write>(
@@ -401,7 +309,7 @@ fn print_ip_result<W: Write>(
         let out = serde_json::json!({
             "ip": ip.to_string(),
             "rdap_server": server,
-            "organization": res.organization,
+            "organization": res.organization.as_deref().unwrap_or("Unknown"),
             "country_code": res.country_code,
             "as_number": res.as_number.map(|n| format!("AS{n}")),
             "cidrs": res.cidrs,
@@ -446,7 +354,7 @@ fn print_domain_result<W: Write>(
         let out = serde_json::json!({
             "domain": res.handle,
             "rdap_server": server,
-            "organization": res.organization,
+            "organization": res.organization.as_deref().unwrap_or("Unknown"),
             "registrar": res.registrar,
             "country_code": res.country_code,
             "nameservers": res.nameservers,
@@ -488,7 +396,7 @@ fn print_asn_result<W: Write>(
         let out = serde_json::json!({
             "asn": format!("AS{}", res.asn),
             "rdap_server": server,
-            "organization": res.organization,
+            "organization": res.organization.as_deref().unwrap_or("Unknown"),
             "country_code": res.country_code,
             "range": res.range.map(|(s, e)| serde_json::json!({"start": s, "end": e})),
         });
