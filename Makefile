@@ -57,7 +57,7 @@ test-one:
 # ── Lint & format ─────────────────────────────────────────────────────────────
 
 ## Run clippy (deny warnings, as in CI)
-lint:
+lint: fmt-check
 	$(CARGO) clippy --all-targets -- -D warnings
 
 ## Format all source files with rustfmt
@@ -65,7 +65,7 @@ fmt:
 	$(CARGO) fmt
 
 ## Check formatting without modifying files (useful in CI)
-fmt-check:
+fmt-check: fmt
 	$(CARGO) fmt -- --check
 
 # ── Documentation ─────────────────────────────────────────────────────────────
