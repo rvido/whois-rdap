@@ -48,7 +48,11 @@ ipnet = "2"
 
 # Feature 4 — SQLite result cache
 # bundled = compile SQLite from source; no system libsqlite3 dependency.
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Pinned to match lanwatch's rusqlite version: libsqlite3-sys `links = "sqlite3"`,
+# so any two crates in the same dependency graph pulling in different
+# libsqlite3-sys versions fail to resolve at all (this bit AncileNet, which
+# depends on both this crate and lanwatch).
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Feature 1 — parallel bulk streaming via buffer_unordered
 futures = { version = "0.3", default-features = false, features = ["std"] }
