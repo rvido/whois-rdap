@@ -8,13 +8,15 @@
 //   https://data.iana.org/rdap/ipv6.json
 //   https://data.iana.org/rdap/asn.json
 //
-// The map lives in-process as three sorted prefix arrays.  Lookup is a single
-// binary-search O(log N) operation with zero heap allocation.  The bootstrap
-// JSON files are cached to `$XDG_CACHE_HOME/whois-rdap/bootstrap/` and
-// refreshed when their on-disk mtime exceeds BOOTSTRAP_TTL_SECS.
+// The map lives in-process as three sorted prefix arrays. Lookup is a linear
+// scan for the longest covering prefix (O(N), zero heap allocation) — the
+// IANA bootstrap files list at most a few hundred prefixes/ranges each, so
+// this is dominated by the network round-trip that follows, not by the scan.
+// The bootstrap JSON files are cached to `$XDG_CACHE_HOME/whois-rdap/bootstrap/`
+// and refreshed when their on-disk mtime exceeds BOOTSTRAP_TTL_SECS.
 
 use anyhow::{Context, Result, anyhow};
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 use std::net::IpAddr;
 use std::ops::RangeInclusive;
@@ -41,7 +43,9 @@ struct BootstrapFile {
 
 /// In-memory routing table built from IANA bootstrap JSON.
 ///
-/// All three prefix arrays are sorted so lookups can use binary search.
+/// All three prefix arrays are kept sorted (by start address / range start),
+/// though lookups currently do a linear scan for the longest covering
+/// prefix — see the module docs above for why that's fine here.
 /// The stored base-URL strings are `Box<str>` (single heap allocation per
 /// entry, never cloned — callers receive a `&str` reference).
 pub struct BootstrapMap {
@@ -109,6 +113,30 @@ impl BootstrapMap {
                 .filter(|(net, _)| net.contains(&v6))
                 .max_by_key(|(net, _)| net.prefix_len())
                 .map(|(_, url)| url.as_ref()),
+        }
+    }
+
+    /// Find the covering bootstrap delegation prefix for an IP address (the
+    /// same longest-prefix-match `find_ip` uses, but returning the prefix
+    /// itself rather than its RDAP URL).
+    ///
+    /// Useful as a real allocation boundary for grouping/collapsing
+    /// concurrent lookups — much coarser than an individual RDAP
+    /// allocation, but far more accurate than a fixed-width heuristic.
+    pub fn find_ip_prefix(&self, ip: IpAddr) -> Option<IpNet> {
+        match ip {
+            IpAddr::V4(v4) => self
+                .ipv4
+                .iter()
+                .filter(|(net, _)| net.contains(&v4))
+                .max_by_key(|(net, _)| net.prefix_len())
+                .map(|(net, _)| IpNet::V4(*net)),
+            IpAddr::V6(v6) => self
+                .ipv6
+                .iter()
+                .filter(|(net, _)| net.contains(&v6))
+                .max_by_key(|(net, _)| net.prefix_len())
+                .map(|(net, _)| IpNet::V6(*net)),
         }
     }
 
@@ -289,6 +317,20 @@ mod tests {
         // 8.8.8.8 is in both 8.0.0.0/8 AND 8.8.0.0/16 — should pick /16 (longer)
         let result = map.find_ip("8.8.8.8".parse::<IpAddr>().unwrap());
         assert_eq!(result, Some("https://google.example"));
+    }
+
+    #[test]
+    fn test_find_ip_prefix_returns_longest_matching_net() {
+        let map = make_map();
+        let result = map.find_ip_prefix("8.8.8.8".parse::<IpAddr>().unwrap());
+        assert_eq!(result, Some("8.8.0.0/16".parse::<IpNet>().unwrap()));
+    }
+
+    #[test]
+    fn test_find_ip_prefix_v6() {
+        let map = make_map();
+        let result = map.find_ip_prefix("2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(result, Some("2001:db8::/32".parse::<IpNet>().unwrap()));
     }
 
     #[test]

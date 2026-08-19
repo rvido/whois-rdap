@@ -15,9 +15,10 @@ result cache, smart redirect following, and parallel bulk lookups — all with a
 | Feature | Description |
 |---|---|
 | **Auto-detect** | Query type is inferred from the input (IP / Domain / ASN) |
+| **IDN support** | Unicode domains are converted to punycode (`xn--...`) per RFC 7482 |
 | **Bootstrap triage** | Routes automatically to the correct RIR via IANA bootstrap maps (RFC 9224) |
 | **SQLite cache** | Avoids redundant lookups; TTL-based expiry per query type |
-| **Redirect following** | Chases RDAP `links` for richer sub-registry data |
+| **Redirect following** | Chases RDAP `links` for richer sub-registry data (IP, Domain, and ASN); HTTPS-only, blocks redirects to private/loopback/link-local addresses |
 | **Parallel bulk** | Process thousands of targets from a file or stdin (bounded concurrency) |
 | **IPv4 & IPv6** | Full dual-stack support |
 | **JSON / NDJSON** | Compact JSON output for single queries; NDJSON stream for bulk |
@@ -71,6 +72,9 @@ whois-rdap 8.8.8.8
 # Single domain
 whois-rdap google.com
 
+# Unicode (IDN) domain — converted to punycode automatically
+whois-rdap münchen.de
+
 # Single ASN
 whois-rdap AS15169
 
@@ -109,6 +113,7 @@ Query type is auto-detected from the input:
 | `2001:4860:4860::8888` | IPv6 |
 | `AS15169` or `15169` | ASN |
 | `google.com` | Domain |
+| `münchen.de` | Domain (converted to `xn--mnchen-3ya.de`) |
 
 ---
 
@@ -179,6 +184,12 @@ Cache location: `$XDG_CACHE_HOME/whois-rdap/cache.db`
 RDAP responses sometimes include `links` arrays pointing to sub-registries
 with richer data. Setting `--max-redirects 1` (default) follows one hop;
 `--max-redirects 0` disables this entirely.
+
+For safety, a redirect is only followed when its `href` is `https://` and
+resolves solely to public, globally-routable addresses — loopback, RFC 1918
+private, link-local (including cloud metadata endpoints), carrier-grade NAT,
+and IPv6 unique-local/multicast targets are refused. This applies uniformly
+to IP, Domain, and ASN lookups.
 
 ---
 
@@ -352,14 +363,21 @@ Errors produce:
 ### SQLite cache
 
 ```rust
-use whois_rdap::cache::{Cache, key_ip, key_domain, key_asn};
+use whois_rdap::cache::{Cache, key_domain};
 
 let cache = Cache::open()?;          // ~/.cache/whois-rdap/cache.db
 
-// Read (zero-copy BLOB → Value, expired entries automatically excluded)
-if let Some(raw) = cache.get(&key_ip(&"8.8.8.8".parse()?))? {
+// IP reads are range-aware: get_ip(ip) matches an exact cached key OR any
+// previously-cached allocation range that covers `ip` (narrowest range wins).
+if let Some(raw) = cache.get_ip("8.8.8.8".parse()?)? {
     let res = whois_rdap::parse_ip_response(raw);
     println!("{}", res.organization.unwrap_or_default());
+}
+
+// Domain/ASN reads are exact-key only (zero-copy BLOB → Value).
+if let Some(raw) = cache.get(&key_domain("google.com"))? {
+    let res = whois_rdap::parse_domain_response("google.com", raw);
+    println!("{}", res.registrar.unwrap_or_default());
 }
 
 // Write (non-blocking, dispatched to spawn_blocking)
@@ -374,7 +392,7 @@ handle.await?;
 ```
 src/
   lib.rs        — RdapClient, result types, JSON extractors, public parse helpers
-  bootstrap.rs  — IANA bootstrap routing (IPv4/IPv6/ASN prefix tables, O(log N))
+  bootstrap.rs  — IANA bootstrap routing (IPv4/IPv6/ASN prefix tables, linear scan over a few hundred entries)
   cache.rs      — SQLite TTL cache (WAL, zero-copy read, spawn_blocking writes)
   redirect.rs   — RDAP link follower (rel=related hop chasing, zero-copy href)
   bulk.rs       — Parallel bulk executor (buffer_unordered streaming)
@@ -385,11 +403,11 @@ src/
 
 ```
 query
-  → bootstrap triage (O(log N), binary search, zero alloc)
+  → bootstrap triage (longest-prefix-match scan, zero alloc)
   → SQLite cache read (indexed SELECT, zero-copy BLOB → serde_json)
       HIT  → return immediately
       MISS → HTTP GET (reqwest connection pool + TLS session reuse)
-           → redirect follow (optional, 1 hop default, href zero-copy)
+           → redirect follow (optional, 1 hop default, https + public-address only)
            → SQLite write (spawn_blocking, non-blocking to caller)
            → return result
 ```

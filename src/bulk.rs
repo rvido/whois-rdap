@@ -182,23 +182,39 @@ impl<'a> Drop for ActiveQueryGuard<'a> {
     }
 }
 
-fn get_group_key(target: &QueryTarget) -> String {
+/// Group key used to collapse concurrent lookups via SingleFlight.
+///
+/// For IPs, prefers the real delegation boundary from the IANA bootstrap map
+/// (e.g. a whole `20.0.0.0/8` RIR block) when available — far more accurate
+/// than a fixed-width guess, since real allocations are often wider than a
+/// /16 (or narrower). Falls back to a fixed /16 (v4) / /48 (v6) heuristic
+/// when no bootstrap map was loaded (`--no-bootstrap`) or the address isn't
+/// covered by it.
+fn get_group_key(
+    target: &QueryTarget,
+    bootstrap: Option<&crate::bootstrap::BootstrapMap>,
+) -> String {
     match target {
-        QueryTarget::Ip(ip) => match ip {
-            IpAddr::V4(ipv4) => {
-                let octets = ipv4.octets();
-                // Group by /16 to collapse queries within the same broad provider block
-                format!("group:ipv4:{}.{}", octets[0], octets[1])
+        QueryTarget::Ip(ip) => {
+            if let Some(net) = bootstrap.and_then(|b| b.find_ip_prefix(*ip)) {
+                return format!("group:ip:{net}");
             }
-            IpAddr::V6(ipv6) => {
-                let segments = ipv6.segments();
-                // Group by /48 for IPv6
-                format!(
-                    "group:ipv6:{:x}:{:x}:{:x}",
-                    segments[0], segments[1], segments[2]
-                )
+            match ip {
+                IpAddr::V4(ipv4) => {
+                    let octets = ipv4.octets();
+                    // Group by /16 to collapse queries within the same broad provider block
+                    format!("group:ipv4:{}.{}", octets[0], octets[1])
+                }
+                IpAddr::V6(ipv6) => {
+                    let segments = ipv6.segments();
+                    // Group by /48 for IPv6
+                    format!(
+                        "group:ipv6:{:x}:{:x}:{:x}",
+                        segments[0], segments[1], segments[2]
+                    )
+                }
             }
-        },
+        }
         QueryTarget::Domain(domain) => {
             format!("group:domain:{}", domain)
         }
@@ -215,7 +231,7 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         QueryTarget::Domain(domain) => crate::cache::key_domain(domain),
         QueryTarget::Asn(asn) => crate::cache::key_asn(*asn),
     };
-    let group_key = get_group_key(&target);
+    let group_key = get_group_key(&target, ctx.bootstrap.as_deref());
 
     // 1. Cache hit path (IP range-aware, domain/ASN exact match)
     if let Some(ref cache) = ctx.cache {
@@ -253,10 +269,17 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         }
     };
 
-    // Only the initiator (the task that just inserted the map entry) owns a
-    // cleanup guard — if this task is cancelled before finish_query runs,
-    // the guard's Drop impl removes the orphaned entry and unblocks waiters.
-    let _guard = rx.is_none().then(|| ActiveQueryGuard {
+    // Only the initiator (the task that just inserted the map entry) owns
+    // that entry: it alone may broadcast completion via finish_query below,
+    // and it alone gets a cleanup guard (if this task is cancelled before
+    // finish_query runs, the guard's Drop impl removes the orphaned entry
+    // and unblocks waiters). A waiter that falls through to its own network
+    // lookup below (because the leader's range didn't cover it) must NOT
+    // touch this group_key's entry — by the time it finishes, a different
+    // task may have become the new initiator for the same key, and calling
+    // finish_query would clobber that unrelated entry.
+    let is_initiator = rx.is_none();
+    let _guard = is_initiator.then(|| ActiveQueryGuard {
         ctx,
         key: group_key.clone(),
     });
@@ -341,7 +364,9 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         Ok(c) => c,
         Err(e) => {
             let err_msg = e.to_string();
-            ctx.finish_query(&group_key, (cache_key.clone(), Err(err_msg.clone())));
+            if is_initiator {
+                ctx.finish_query(&group_key, (cache_key.clone(), Err(err_msg.clone())));
+            }
             return BulkRecord::Error(raw, err_msg);
         }
     };
@@ -350,7 +375,7 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         QueryTarget::Ip(ip) => match client.lookup_ip(*ip).await {
             Ok(res) => {
                 // Follow redirects
-                let followed =
+                let (followed, _) =
                     crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
                         .await;
                 let res = if followed != res.raw {
@@ -383,7 +408,7 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         QueryTarget::Domain(domain) => match client.lookup_domain(domain).await {
             Ok(res) => {
                 // Follow redirects
-                let followed =
+                let (followed, _) =
                     crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
                         .await;
                 let res = if followed != res.raw {
@@ -403,6 +428,15 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         },
         QueryTarget::Asn(asn) => match client.lookup_asn(*asn).await {
             Ok(res) => {
+                // Follow redirects — same as the Ip/Domain arms above.
+                let (followed, _) =
+                    crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
+                        .await;
+                let res = if followed != res.raw {
+                    crate::parse_asn_response(*asn, followed)
+                } else {
+                    res
+                };
                 // Write cache — awaited, see comment above.
                 if let Some(ref cache) = ctx.cache {
                     let _ = cache
@@ -429,8 +463,11 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         Err(err) => BulkRecord::Error(raw, err.clone()),
     };
 
-    // 5. Broadcast to waiters and clean up active map
-    ctx.finish_query(&group_key, (cache_key, result));
+    // 5. Broadcast to waiters and clean up active map — only the initiator
+    // owns this group_key's entry (see comment at `is_initiator` above).
+    if is_initiator {
+        ctx.finish_query(&group_key, (cache_key, result));
+    }
 
     record
 }
@@ -692,6 +729,19 @@ mod tests {
             QueryTarget::Domain(_)
         ));
         assert!(matches!(classify_query("İstanbul"), QueryTarget::Domain(_)));
+    }
+
+    #[test]
+    fn test_classify_query_idn_domain_converted_to_punycode() {
+        // RFC 7482 requires the A-label (punycode) form on the wire.
+        assert!(matches!(
+            classify_query("日本語.jp"),
+            QueryTarget::Domain(d) if d == "xn--wgv71a119e.jp"
+        ));
+        assert!(matches!(
+            classify_query("münchen.de"),
+            QueryTarget::Domain(d) if d == "xn--mnchen-3ya.de"
+        ));
     }
 
     #[test]

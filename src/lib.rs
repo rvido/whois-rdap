@@ -22,7 +22,10 @@ pub(crate) fn install_ring_provider() {
 }
 
 /// User-Agent header sent on all RDAP HTTP requests.
-pub const USER_AGENT: &str = "rdap-client/0.3 (Rust)";
+///
+/// Derived from `CARGO_PKG_VERSION` at compile time so it can never drift
+/// from the crate's actual released version.
+pub const USER_AGENT: &str = concat!("rdap-client/", env!("CARGO_PKG_VERSION"), " (Rust)");
 
 /// Build a `reqwest::Client` configured for RDAP use: shared user-agent,
 /// timeout, and one-time TLS crypto provider installation.
@@ -51,8 +54,12 @@ pub enum QueryTarget {
 ///
 /// Safe for any UTF-8 input: never slices a string at a fixed byte offset,
 /// so a query starting with a multi-byte character (e.g. an IDN label typed
-/// in native Unicode) cannot panic. Domain names are normalised to
-/// ASCII-lowercase so single-query and bulk lookups share cache keys.
+/// in native Unicode) cannot panic. Domain names are converted to their
+/// ASCII A-label form (IDNA/punycode, e.g. "xn--..."), which also lowercases
+/// them — required by RFC 7482 for RDAP servers, and needed so single-query
+/// and bulk lookups share cache keys regardless of how the domain was typed.
+/// If IDNA conversion fails (malformed input), falls back to a plain
+/// ASCII-lowercased copy rather than erroring.
 pub fn classify_query(s: &str) -> QueryTarget {
     let trimmed = s.trim();
     if let Ok(ip) = trimmed.parse::<IpAddr>() {
@@ -65,7 +72,8 @@ pub fn classify_query(s: &str) -> QueryTarget {
     {
         return QueryTarget::Asn(asn);
     }
-    QueryTarget::Domain(trimmed.to_ascii_lowercase())
+    let domain = idna::domain_to_ascii(trimmed).unwrap_or_else(|_| trimmed.to_ascii_lowercase());
+    QueryTarget::Domain(domain)
 }
 
 /// If `s` begins with a case-insensitive "AS" prefix, returns the remainder
@@ -334,17 +342,17 @@ impl RdapClient {
         &self.http
     }
 
-    /// Lookup an IP (v4 or v6) and extract org + country + CIDRs + range.
+    /// GET `{base}/{segments...}` and decode the response as RDAP JSON.
     ///
-    /// Queries: `{base}/ip/{ip}`
-    pub async fn lookup_ip(&self, ip: IpAddr) -> Result<RdapResult> {
+    /// Shared by `lookup_ip`/`lookup_domain`/`lookup_asn` so the request,
+    /// status-check, and decode logic can't drift between them.
+    async fn fetch_rdap_json(&self, segments: &[&str]) -> Result<Value> {
         let mut url = self.base.clone();
         {
-            let mut segments = url.path_segments_mut().map_err(|_| {
+            let mut path = url.path_segments_mut().map_err(|_| {
                 anyhow!("Base URL cannot be a base for path segments: {}", self.base)
             })?;
-            segments.push("ip");
-            segments.push(&ip.to_string());
+            path.extend(segments);
         }
         let resp = self
             .http
@@ -367,125 +375,31 @@ impl RdapClient {
             .bytes()
             .await
             .context("Failed to read response bytes")?;
-        let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
-        let organization = extract_org(&json);
-        let country_code = extract_country_code(&json);
-        let cidrs = extract_cidrs(&json);
-        let range = extract_range(&json);
-        let as_number = extract_as_number(&json);
+        serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")
+    }
 
-        Ok(RdapResult {
-            organization,
-            country_code,
-            cidrs,
-            range,
-            as_number,
-            raw: json,
-        })
+    /// Lookup an IP (v4 or v6) and extract org + country + CIDRs + range.
+    ///
+    /// Queries: `{base}/ip/{ip}`
+    pub async fn lookup_ip(&self, ip: IpAddr) -> Result<RdapResult> {
+        let json = self.fetch_rdap_json(&["ip", &ip.to_string()]).await?;
+        Ok(parse_ip_response(json))
     }
 
     /// Lookup a Domain and extract registrant + registrar + country + nameservers.
     ///
     /// Queries: `{base}/domain/{domain}`
     pub async fn lookup_domain(&self, domain: &str) -> Result<RdapDomainResult> {
-        let mut url = self.base.clone();
-        {
-            let mut segments = url.path_segments_mut().map_err(|_| {
-                anyhow!("Base URL cannot be a base for path segments: {}", self.base)
-            })?;
-            segments.push("domain");
-            segments.push(domain);
-        }
-        let resp = self
-            .http
-            .get(url.clone())
-            .send()
-            .await
-            .with_context(|| format!("Failed to GET {}", url))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "RDAP server returned status {}.\nBody: {}",
-                status,
-                truncate(&body, 2000)
-            ));
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .context("Failed to read response bytes")?;
-        let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
-        let handle = json
-            .get("ldhName")
-            .or_else(|| json.get("handle"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(domain)
-            .to_string();
-        let organization = extract_org(&json);
-        let registrar = extract_registrar(&json);
-        let country_code = extract_country_code(&json);
-        let nameservers = extract_nameservers(&json);
-        let status = extract_status(&json);
-
-        Ok(RdapDomainResult {
-            handle,
-            organization,
-            registrar,
-            country_code,
-            nameservers,
-            status,
-            raw: json,
-        })
+        let json = self.fetch_rdap_json(&["domain", domain]).await?;
+        Ok(parse_domain_response(domain, json))
     }
 
     /// Lookup an Autonomous System Number (ASN) and extract org + country + range.
     ///
     /// Queries: `{base}/autnum/{asn}`
     pub async fn lookup_asn(&self, asn: u32) -> Result<RdapAsnResult> {
-        let mut url = self.base.clone();
-        {
-            let mut segments = url.path_segments_mut().map_err(|_| {
-                anyhow!("Base URL cannot be a base for path segments: {}", self.base)
-            })?;
-            segments.push("autnum");
-            segments.push(&asn.to_string());
-        }
-        let resp = self
-            .http
-            .get(url.clone())
-            .send()
-            .await
-            .with_context(|| format!("Failed to GET {}", url))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "RDAP server returned status {}.\nBody: {}",
-                status,
-                truncate(&body, 2000)
-            ));
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .context("Failed to read response bytes")?;
-        let json: Value = serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")?;
-        let organization = extract_org(&json);
-        let country_code = extract_country_code(&json);
-        let range = extract_asn_range(&json);
-
-        Ok(RdapAsnResult {
-            asn,
-            organization,
-            country_code,
-            range,
-            raw: json,
-        })
+        let json = self.fetch_rdap_json(&["autnum", &asn.to_string()]).await?;
+        Ok(parse_asn_response(asn, json))
     }
 }
 
@@ -618,8 +532,12 @@ fn extract_status(root: &Value) -> Vec<String> {
 }
 
 fn extract_asn_range(root: &Value) -> Option<(u32, u32)> {
-    let start = root.get("startAutnum").and_then(|v| v.as_u64())? as u32;
-    let end = root.get("endAutnum").and_then(|v| v.as_u64())? as u32;
+    let start = root.get("startAutnum").and_then(|v| v.as_u64())?;
+    let end = root.get("endAutnum").and_then(|v| v.as_u64())?;
+    // Reject rather than silently truncate an out-of-range value from a
+    // malformed/non-conformant server.
+    let start = u32::try_from(start).ok()?;
+    let end = u32::try_from(end).ok()?;
     Some((start, end))
 }
 

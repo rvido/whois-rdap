@@ -213,17 +213,17 @@ async fn main() -> Result<()> {
 
             match client.lookup_ip(ip).await {
                 Ok(res) => {
-                    // Optionally follow RDAP links for richer data.
-                    // If follow_links returns a different JSON, re-extract.
-                    // If unchanged (no useful link found), keep the already-
-                    // extracted res — do NOT rebuild from raw.
-                    let followed =
+                    // Optionally follow RDAP links for richer data. If a
+                    // redirect was actually followed, the data came from a
+                    // different server than `base_url` — report that instead.
+                    let (followed, followed_from) =
                         follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
                     let res = if followed != res.raw {
                         whois_rdap::parse_ip_response(followed)
                     } else {
                         res
                     };
+                    let effective_server = followed_from.as_deref().unwrap_or(&base_url);
 
                     // Store range bounds so future lookups for any IP in the
                     // same allocation are served from cache (no network call).
@@ -233,7 +233,7 @@ async fn main() -> Result<()> {
                         });
                         c.insert_ip_background(cache_key, &res.raw, range_bounds, ttl);
                     }
-                    print_ip_result(&mut handle, ip, &base_url, &res, args.json)?;
+                    print_ip_result(&mut handle, ip, effective_server, &res, args.json)?;
                 }
                 Err(e) => return handle_error(e),
             }
@@ -253,17 +253,18 @@ async fn main() -> Result<()> {
 
             match client.lookup_domain(&domain).await {
                 Ok(res) => {
-                    let followed =
+                    let (followed, followed_from) =
                         follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
                     let res = if followed != res.raw {
                         whois_rdap::parse_domain_response(&domain, followed)
                     } else {
                         res
                     };
+                    let effective_server = followed_from.as_deref().unwrap_or(&base_url);
                     if let Some(ref c) = cache {
                         c.insert_background(cache_key, &res.raw, ttl);
                     }
-                    print_domain_result(&mut handle, &base_url, &res, args.json)?;
+                    print_domain_result(&mut handle, effective_server, &res, args.json)?;
                 }
                 Err(e) => return handle_error(e),
             }
@@ -283,10 +284,18 @@ async fn main() -> Result<()> {
 
             match client.lookup_asn(asn).await {
                 Ok(res) => {
+                    let (followed, followed_from) =
+                        follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
+                    let res = if followed != res.raw {
+                        whois_rdap::parse_asn_response(asn, followed)
+                    } else {
+                        res
+                    };
+                    let effective_server = followed_from.as_deref().unwrap_or(&base_url);
                     if let Some(ref c) = cache {
                         c.insert_background(cache_key, &res.raw, ttl);
                     }
-                    print_asn_result(&mut handle, &base_url, &res, args.json)?;
+                    print_asn_result(&mut handle, effective_server, &res, args.json)?;
                 }
                 Err(e) => return handle_error(e),
             }

@@ -1,6 +1,6 @@
 [package]
 name = "whois-rdap"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
@@ -40,11 +40,18 @@ tokio = { version = "1.52", default-features = false, features = [
     "io-std",           # async stdin reading
     "io-util",          # AsyncBufReadExt
     "sync",             # Mutex for cache connection
+    "net",              # lookup_host: SSRF guard for redirect-following
 ] }
 
 # Feature 2 — IANA bootstrap triage
 # Ipv4Net / Ipv6Net prefix types + Contains trait for longest-prefix-match.
 ipnet = "2"
+
+# IDNA (Internationalized Domain Names): converts Unicode domain labels to
+# the ASCII A-label ("xn--...") form RDAP servers expect per RFC 7482.
+# Already pulled in transitively by `url` (a reqwest dependency), so this
+# adds no new code to the binary — just names the version we rely on.
+idna = "1"
 
 # Feature 4 — SQLite result cache
 # bundled = compile SQLite from source; no system libsqlite3 dependency.
