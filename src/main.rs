@@ -212,15 +212,25 @@ async fn main() -> Result<()> {
             }
 
             match client.lookup_ip(ip).await {
-                Ok(res) => {
+                Ok(mut res) => {
                     // Optionally follow RDAP links for richer data. If a
                     // redirect was actually followed, the data came from a
                     // different server than `base_url` — report that instead.
-                    let (followed, followed_from) =
-                        follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
-                    let res = if followed != res.raw {
+                    //
+                    // `raw` is moved in and handed back, so this costs no copy:
+                    // `followed_from` already tells us whether a hop happened,
+                    // which is what the old `followed != res.raw` compare (and
+                    // its full-document clone) was there to determine.
+                    let (followed, followed_from) = follow_links(
+                        client.http_client(),
+                        std::mem::take(&mut res.raw),
+                        max_redirects,
+                    )
+                    .await;
+                    let res = if followed_from.is_some() {
                         whois_rdap::parse_ip_response(followed)
                     } else {
+                        res.raw = followed;
                         res
                     };
                     let effective_server = followed_from.as_deref().unwrap_or(&base_url);
@@ -252,12 +262,17 @@ async fn main() -> Result<()> {
             }
 
             match client.lookup_domain(&domain).await {
-                Ok(res) => {
-                    let (followed, followed_from) =
-                        follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
-                    let res = if followed != res.raw {
+                Ok(mut res) => {
+                    let (followed, followed_from) = follow_links(
+                        client.http_client(),
+                        std::mem::take(&mut res.raw),
+                        max_redirects,
+                    )
+                    .await;
+                    let res = if followed_from.is_some() {
                         whois_rdap::parse_domain_response(&domain, followed)
                     } else {
+                        res.raw = followed;
                         res
                     };
                     let effective_server = followed_from.as_deref().unwrap_or(&base_url);
@@ -283,12 +298,17 @@ async fn main() -> Result<()> {
             }
 
             match client.lookup_asn(asn).await {
-                Ok(res) => {
-                    let (followed, followed_from) =
-                        follow_links(client.http_client(), res.raw.clone(), max_redirects).await;
-                    let res = if followed != res.raw {
+                Ok(mut res) => {
+                    let (followed, followed_from) = follow_links(
+                        client.http_client(),
+                        std::mem::take(&mut res.raw),
+                        max_redirects,
+                    )
+                    .await;
+                    let res = if followed_from.is_some() {
                         whois_rdap::parse_asn_response(asn, followed)
                     } else {
+                        res.raw = followed;
                         res
                     };
                     let effective_server = followed_from.as_deref().unwrap_or(&base_url);

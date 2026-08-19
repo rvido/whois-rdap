@@ -4,6 +4,7 @@
 pub mod bootstrap;
 pub mod bulk;
 pub mod cache;
+pub(crate) mod http;
 pub mod redirect;
 
 use anyhow::{Context, Result, anyhow};
@@ -21,6 +22,9 @@ pub(crate) fn install_ring_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// `Accept` header sent on all RDAP HTTP requests.
+pub(crate) const RDAP_ACCEPT: &str = "application/rdap+json, application/json";
+
 /// User-Agent header sent on all RDAP HTTP requests.
 ///
 /// Derived from `CARGO_PKG_VERSION` at compile time so it can never drift
@@ -34,11 +38,17 @@ pub const USER_AGENT: &str = concat!("rdap-client/", env!("CARGO_PKG_VERSION"), 
 /// downloads or bulk mode's shared connection pool) should use this instead
 /// of hand-rolling a builder, so the user-agent string and TLS setup never
 /// drift from `RdapClient::for_custom`'s.
+///
+/// Automatic redirect following is **disabled**: reqwest's default policy
+/// chases up to 10 `Location:` hops to any address, which would let a remote
+/// RDAP server bounce us into internal infrastructure. Redirects are instead
+/// followed by `crate::http::get_guarded`, which validates every hop.
 pub fn build_reqwest_client(timeout: Duration) -> Result<reqwest::Client> {
     install_ring_provider();
     Ok(reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
 
@@ -354,28 +364,19 @@ impl RdapClient {
             })?;
             path.extend(segments);
         }
-        let resp = self
-            .http
-            .get(url.clone())
-            .send()
-            .await
-            .with_context(|| format!("Failed to GET {}", url))?;
+        // Redirects are followed by `get_guarded`, which validates every hop
+        // against the SSRF guard, and the body is size-capped there.
+        let fetched = crate::http::get_guarded(&self.http, url, Some(RDAP_ACCEPT)).await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        if !fetched.status.is_success() {
             return Err(anyhow!(
                 "RDAP server returned status {}.\nBody: {}",
-                status,
-                truncate(&body, 2000)
+                fetched.status,
+                truncate(&fetched.body_lossy(), 2000)
             ));
         }
 
-        let bytes = resp
-            .bytes()
-            .await
-            .context("Failed to read response bytes")?;
-        serde_json::from_slice(&bytes).context("Failed to decode RDAP JSON")
+        serde_json::from_slice(&fetched.body).context("Failed to decode RDAP JSON")
     }
 
     /// Lookup an IP (v4 or v6) and extract org + country + CIDRs + range.
@@ -920,12 +921,20 @@ fn extract_range(root: &Value) -> Option<(String, String)> {
     Some((start.to_string(), end.to_string()))
 }
 
+/// Truncate `s` to at most `max` **bytes**, never splitting a UTF-8 character.
+///
+/// Used on error-response bodies from remote servers, so it must tolerate
+/// arbitrary UTF-8: slicing at a fixed byte offset would panic whenever a
+/// multi-byte character straddles that offset.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}… ({} chars truncated)", &s[..max], s.len() - max)
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes truncated)", &s[..end], s.len() - end)
 }
 
 #[cfg(test)]
@@ -938,6 +947,37 @@ mod tests {
         assert_eq!(RdapRegistry::from_str("ripe").unwrap(), RdapRegistry::RIPE);
         assert_eq!(RdapRegistry::from_str("ARIN").unwrap(), RdapRegistry::ARIN);
         assert!(RdapRegistry::from_str("unknown").is_err());
+    }
+
+    /// Regression: `truncate` used to slice at a fixed byte offset, which
+    /// panics whenever a multi-byte character straddles that offset. The input
+    /// is an error body from a remote server, so this was remotely triggerable
+    /// (and `panic = "abort"` in release turns it into a hard crash).
+    #[test]
+    fn test_truncate_does_not_panic_on_multibyte_boundary() {
+        let mut s = "a".repeat(1999);
+        s.push('\u{e9}'); // 2 bytes, straddling byte 2000
+        s.push_str(&"b".repeat(100));
+        assert!(
+            !s.is_char_boundary(2000),
+            "test input must straddle the cut"
+        );
+
+        let out = truncate(&s, 2000); // must not panic
+        assert!(out.starts_with(&"a".repeat(1999)));
+        assert!(out.contains("bytes truncated"));
+    }
+
+    #[test]
+    fn test_truncate_returns_short_input_unchanged() {
+        assert_eq!(truncate("hello", 2000), "hello");
+    }
+
+    #[test]
+    fn test_truncate_handles_multibyte_only_input() {
+        let s = "\u{65e5}".repeat(2000); // 3 bytes each
+        let out = truncate(&s, 2000);
+        assert!(out.contains("bytes truncated"));
     }
 
     #[test]

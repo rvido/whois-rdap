@@ -18,7 +18,8 @@ result cache, smart redirect following, and parallel bulk lookups — all with a
 | **IDN support** | Unicode domains are converted to punycode (`xn--...`) per RFC 7482 |
 | **Bootstrap triage** | Routes automatically to the correct RIR via IANA bootstrap maps (RFC 9224) |
 | **SQLite cache** | Avoids redundant lookups; TTL-based expiry per query type |
-| **Redirect following** | Chases RDAP `links` for richer sub-registry data (IP, Domain, and ASN); HTTPS-only, blocks redirects to private/loopback/link-local addresses |
+| **Redirect following** | Chases RDAP `links` for richer sub-registry data (IP, Domain, and ASN) |
+| **SSRF hardening** | Server-chosen targets — RDAP `links` *and* HTTP 3xx hops — must be HTTPS and publicly routable; body size capped |
 | **Parallel bulk** | Process thousands of targets from a file or stdin (bounded concurrency) |
 | **IPv4 & IPv6** | Full dual-stack support |
 | **JSON / NDJSON** | Compact JSON output for single queries; NDJSON stream for bulk |
@@ -159,6 +160,10 @@ AS15169
 Bootstrap maps are cached for **24 hours** per RFC 9224 at:
 `$XDG_CACHE_HOME/whois-rdap/bootstrap/` (usually `~/.cache/whois-rdap/bootstrap/`).
 
+If a refresh fails but a cached copy exists, the stale copy is used and a
+warning is printed — losing the network degrades routing to "slightly out of
+date" rather than disabling bootstrap triage entirely.
+
 ### Result cache
 
 | Flag | Default | Description |
@@ -185,11 +190,24 @@ RDAP responses sometimes include `links` arrays pointing to sub-registries
 with richer data. Setting `--max-redirects 1` (default) follows one hop;
 `--max-redirects 0` disables this entirely.
 
-For safety, a redirect is only followed when its `href` is `https://` and
-resolves solely to public, globally-routable addresses — loopback, RFC 1918
+For safety, any target chosen by a *remote server* — both an RDAP `links`
+href and an HTTP `Location:` redirect — is only followed when it is `https://`
+and resolves solely to public, globally-routable addresses. Loopback, RFC 1918
 private, link-local (including cloud metadata endpoints), carrier-grade NAT,
-and IPv6 unique-local/multicast targets are refused. This applies uniformly
-to IP, Domain, and ASN lookups.
+and IPv6 unique-local/multicast targets are refused. This applies uniformly to
+IP, Domain, and ASN lookups.
+
+The URL *you* choose (`--server`, `--rir`, or a bootstrap entry) is exempt, so
+pointing the tool at an internal mirror or `http://localhost:8080` still works.
+
+Response bodies are capped at 8 MiB, and at most 5 HTTP redirect hops are
+followed per request.
+
+> **Note:** the address check runs before the connection, while `reqwest`
+> resolves again when it connects. A determined DNS-rebinding attacker
+> controlling a low-TTL record could still slip between the two; closing that
+> would require pinning the resolved address per request, which reqwest only
+> supports per client.
 
 ---
 
@@ -392,6 +410,7 @@ handle.await?;
 ```
 src/
   lib.rs        — RdapClient, result types, JSON extractors, public parse helpers
+  http.rs       — Guarded fetch layer (SSRF check on every redirect hop, body size cap)
   bootstrap.rs  — IANA bootstrap routing (IPv4/IPv6/ASN prefix tables, linear scan over a few hundred entries)
   cache.rs      — SQLite TTL cache (WAL, zero-copy read, spawn_blocking writes)
   redirect.rs   — RDAP link follower (rel=related hop chasing, zero-copy href)

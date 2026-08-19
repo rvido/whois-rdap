@@ -70,10 +70,11 @@ impl BootstrapMap {
         let ipv6_path = cache_dir.join("ipv6.json");
         let asn_path = cache_dir.join("asn.json");
 
-        // Refresh stale or missing files
-        refresh_file(http, &ipv4_path, IANA_IPV4_URL, force_refresh).await?;
-        refresh_file(http, &ipv6_path, IANA_IPV6_URL, force_refresh).await?;
-        refresh_file(http, &asn_path, IANA_ASN_URL, force_refresh).await?;
+        // Refresh stale or missing files, tolerating a failed refresh when a
+        // usable (if stale) copy is already on disk — see `refresh_or_keep_stale`.
+        refresh_or_keep_stale(http, &ipv4_path, IANA_IPV4_URL, force_refresh).await?;
+        refresh_or_keep_stale(http, &ipv6_path, IANA_IPV6_URL, force_refresh).await?;
+        refresh_or_keep_stale(http, &asn_path, IANA_ASN_URL, force_refresh).await?;
 
         // Parse (sync — files are small, < 50 KB each)
         let ipv4 = parse_ipv4_bootstrap(
@@ -92,28 +93,34 @@ impl BootstrapMap {
         Ok(Self { ipv4, ipv6, asn })
     }
 
+    /// Longest-prefix-match lookup shared by `find_ip` and `find_ip_prefix`.
+    ///
+    /// Returns the most specific covering delegation together with its RDAP
+    /// base URL, so neither caller has to repeat the scan.
+    fn find_ip_entry(&self, ip: IpAddr) -> Option<(IpNet, &str)> {
+        match ip {
+            IpAddr::V4(v4) => self
+                .ipv4
+                .iter()
+                .filter(|(net, _)| net.contains(&v4))
+                .max_by_key(|(net, _)| net.prefix_len())
+                .map(|(net, url)| (IpNet::V4(*net), url.as_ref())),
+            IpAddr::V6(v6) => self
+                .ipv6
+                .iter()
+                .filter(|(net, _)| net.contains(&v6))
+                .max_by_key(|(net, _)| net.prefix_len())
+                .map(|(net, url)| (IpNet::V6(*net), url.as_ref())),
+        }
+    }
+
     /// Find the RDAP base URL for an IP address.
     ///
     /// Uses longest-prefix-match: the most specific covering prefix wins.
     /// Returns `None` if no entry covers the address (should not happen for
     /// public IPs — IANA covers the full unicast space).
     pub fn find_ip(&self, ip: IpAddr) -> Option<&str> {
-        match ip {
-            IpAddr::V4(v4) => {
-                // Walk all matching prefixes, pick the longest (most specific).
-                self.ipv4
-                    .iter()
-                    .filter(|(net, _)| net.contains(&v4))
-                    .max_by_key(|(net, _)| net.prefix_len())
-                    .map(|(_, url)| url.as_ref())
-            }
-            IpAddr::V6(v6) => self
-                .ipv6
-                .iter()
-                .filter(|(net, _)| net.contains(&v6))
-                .max_by_key(|(net, _)| net.prefix_len())
-                .map(|(_, url)| url.as_ref()),
-        }
+        self.find_ip_entry(ip).map(|(_, url)| url)
     }
 
     /// Find the covering bootstrap delegation prefix for an IP address (the
@@ -124,20 +131,7 @@ impl BootstrapMap {
     /// concurrent lookups — much coarser than an individual RDAP
     /// allocation, but far more accurate than a fixed-width heuristic.
     pub fn find_ip_prefix(&self, ip: IpAddr) -> Option<IpNet> {
-        match ip {
-            IpAddr::V4(v4) => self
-                .ipv4
-                .iter()
-                .filter(|(net, _)| net.contains(&v4))
-                .max_by_key(|(net, _)| net.prefix_len())
-                .map(|(net, _)| IpNet::V4(*net)),
-            IpAddr::V6(v6) => self
-                .ipv6
-                .iter()
-                .filter(|(net, _)| net.contains(&v6))
-                .max_by_key(|(net, _)| net.prefix_len())
-                .map(|(net, _)| IpNet::V6(*net)),
-        }
+        self.find_ip_entry(ip).map(|(net, _)| net)
     }
 
     /// Find the RDAP base URL for an Autonomous System Number.
@@ -154,6 +148,28 @@ impl BootstrapMap {
 fn bootstrap_cache_dir() -> Result<PathBuf> {
     let base = crate::default_cache_base()?;
     Ok(base.join("bootstrap"))
+}
+
+/// Refresh `path`, but fall back to an existing stale copy if the download
+/// fails.
+///
+/// Losing the network should degrade bootstrap routing to "slightly out of
+/// date", not to "no routing at all" — IANA delegations change rarely, so a
+/// stale map is far better than none.
+async fn refresh_or_keep_stale(
+    http: &reqwest::Client,
+    path: &std::path::Path,
+    url: &str,
+    force: bool,
+) -> Result<()> {
+    match refresh_file(http, path, url, force).await {
+        Ok(()) => Ok(()),
+        Err(e) if path.exists() => {
+            eprintln!("bootstrap: refresh of {url} failed ({e}); using stale cached copy");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn refresh_file(
@@ -175,16 +191,16 @@ async fn refresh_file(
         }
     }
 
-    let bytes = http
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("Failed to download bootstrap file: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("Bootstrap server error for {url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("Failed to read bootstrap response: {url}"))?;
+    let parsed_url =
+        reqwest::Url::parse(url).with_context(|| format!("Invalid bootstrap URL: {url}"))?;
+    let fetched = crate::http::get_guarded(http, parsed_url, None).await?;
+    if !fetched.status.is_success() {
+        return Err(anyhow!(
+            "Bootstrap server returned {} for {url}",
+            fetched.status
+        ));
+    }
+    let bytes = fetched.body;
 
     // Write atomically via temp file → rename
     let tmp = path.with_extension("tmp");

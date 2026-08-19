@@ -115,6 +115,16 @@ impl Cache {
         &self.conns[idx]
     }
 
+    /// Lock the next pooled connection, recovering from a poisoned mutex.
+    ///
+    /// A poisoned lock means some other thread panicked mid-operation. SQLite
+    /// itself is unaffected (statements are atomic), so the cache stays usable;
+    /// recovering keeps a panic in one lookup from disabling caching for the
+    /// whole process. Every call site uses this, so the policy is uniform.
+    fn locked_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn().lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Look up a key.  Returns `None` on cache miss or if the entry is expired.
     ///
     /// Zero-copy hot path: BLOB is parsed directly from SQLite's buffer via
@@ -122,7 +132,7 @@ impl Cache {
     /// is ever allocated.
     pub fn get(&self, key: &str) -> Result<Option<Value>> {
         let now = unix_now();
-        let conn = self.conn().lock().expect("cache mutex poisoned");
+        let conn = self.locked_conn();
 
         // Single indexed SELECT; expiry check in SQL avoids loading stale rows.
         let mut stmt = conn.prepare_cached(
@@ -170,15 +180,14 @@ impl Cache {
         let cache = self.clone();
         tokio::task::spawn_blocking(move || {
             let now = unix_now() as i64;
-            if let Ok(conn) = cache.conn().lock() {
-                let r = conn.execute(
-                    "INSERT OR REPLACE INTO rdap_cache (key, payload, fetched_at, ttl) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![key, payload, now, ttl as i64],
-                );
-                if let Err(e) = r {
-                    eprintln!("cache: write error for '{key}': {e}");
-                }
+            let conn = cache.locked_conn();
+            let r = conn.execute(
+                "INSERT OR REPLACE INTO rdap_cache (key, payload, fetched_at, ttl) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![key, payload, now, ttl as i64],
+            );
+            if let Err(e) = r {
+                eprintln!("cache: write error for '{key}': {e}");
             }
         })
     }
@@ -198,73 +207,77 @@ impl Cache {
     /// numerically correct across the entire IP space.
     pub fn get_ip(&self, ip: IpAddr) -> Result<Option<Value>> {
         let key = key_ip(&ip);
-        let blob = ip_to_blob(ip);
         let now = unix_now() as i64;
-        let conn = self.conn().lock().expect("cache mutex poisoned");
+        let conn = self.locked_conn();
 
-        // Fetch every candidate row (exact key match, plus any range that
-        // contains `ip`) rather than picking one in SQL: an exact key must
-        // always win, and among range matches the *narrowest* range must
-        // win (e.g. a reassigned /24 nested inside a cached /8 allocation),
-        // which SQLite's simple `ORDER BY ... LIMIT 1` on key-match alone
-        // cannot express. Candidate counts are tiny in practice (a handful
-        // of overlapping allocations at most), so scoring in Rust is cheap.
-        let mut stmt = conn.prepare_cached(
-            "SELECT payload, key, range_start, range_end FROM rdap_cache \
-             WHERE fetched_at + ttl > ?1 \
-               AND (key = ?2 \
-                    OR (range_start IS NOT NULL \
-                        AND range_start <= ?3 \
-                        AND range_end   >= ?3))",
-        )?;
-
-        let mut rows = stmt.query((now, key.as_str(), &blob[..]))?;
-
-        // (is_exact, range_width, payload) — narrower width wins; exact key
-        // always outranks any range match, matched or not.
-        let mut best: Option<(bool, Option<u128>, Value)> = None;
-        while let Some(row) = rows.next()? {
-            let row_key: String = row.get(1)?;
-            let is_exact = row_key == key;
-            let range_start: Option<Vec<u8>> = row.get(2)?;
-            let range_end: Option<Vec<u8>> = row.get(3)?;
-            let width = match (range_start, range_end) {
-                (Some(s), Some(e)) if s.len() == 16 && e.len() == 16 => {
-                    let s = u128::from_be_bytes(s.try_into().unwrap());
-                    let e = u128::from_be_bytes(e.try_into().unwrap());
-                    Some(e.saturating_sub(s))
-                }
-                _ => None,
-            };
-            let blob_ref = row.get_ref(0)?.as_blob()?;
-            let payload: Value = serde_json::from_slice(blob_ref).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Blob,
-                    Box::new(e),
-                )
-            })?;
-
-            let is_better = match &best {
-                None => true,
-                Some((best_exact, best_width, _)) => {
-                    if is_exact != *best_exact {
-                        is_exact
-                    } else {
-                        match (width, best_width) {
-                            (Some(w), Some(bw)) => w < *bw,
-                            (Some(_), None) => true,
-                            _ => false,
-                        }
-                    }
-                }
-            };
-            if is_better {
-                best = Some((is_exact, width, payload));
+        // 1. Exact key. This is a single lookup on the PRIMARY KEY index and
+        //    outranks any range match, so when it hits we are done — no range
+        //    scan and no wasted parsing.
+        {
+            let mut stmt = conn.prepare_cached(
+                "SELECT payload FROM rdap_cache \
+                 WHERE key = ?1 AND fetched_at + ttl > ?2",
+            )?;
+            let exact = stmt
+                .query_row((key.as_str(), now), |row| {
+                    let blob = row.get_ref(0)?.as_blob()?;
+                    serde_json::from_slice(blob).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(e),
+                        )
+                    })
+                })
+                .optional()?;
+            if exact.is_some() {
+                return Ok(exact);
             }
         }
 
-        Ok(best.map(|(_, _, payload)| payload))
+        // 2. Range containment. Kept as a separate statement rather than
+        //    `OR`-ing it with the key predicate above: SQLite cannot use the
+        //    primary-key index and the partial (range_start, range_end) index
+        //    within one OR-ed scan, so the combined form degrades into a full
+        //    table scan as the cache grows.
+        let blob = ip_to_blob(ip);
+        let mut stmt = conn.prepare_cached(
+            "SELECT payload, range_start, range_end FROM rdap_cache \
+             WHERE range_start IS NOT NULL \
+               AND range_start <= ?1 AND range_end >= ?1 \
+               AND fetched_at + ttl > ?2",
+        )?;
+        let mut rows = stmt.query((&blob[..], now))?;
+
+        // The narrowest containing range wins (e.g. a reassigned /24 nested
+        // inside a cached /8 allocation). Only the current best row's bytes are
+        // retained — copying a BLOB is far cheaper than parsing it, so losing
+        // candidates never get deserialised.
+        let mut best: Option<(u128, Vec<u8>)> = None;
+        while let Some(row) = rows.next()? {
+            let range_start: Vec<u8> = row.get(1)?;
+            let range_end: Vec<u8> = row.get(2)?;
+            let (Ok(s), Ok(e)) = (
+                <[u8; 16]>::try_from(&range_start[..]),
+                <[u8; 16]>::try_from(&range_end[..]),
+            ) else {
+                continue; // malformed bounds — ignore this row
+            };
+            let width = u128::from_be_bytes(e).saturating_sub(u128::from_be_bytes(s));
+            if best
+                .as_ref()
+                .is_none_or(|(best_width, _)| width < *best_width)
+            {
+                best = Some((width, row.get_ref(0)?.as_blob()?.to_vec()));
+            }
+        }
+
+        match best {
+            Some((_, bytes)) => Ok(Some(
+                serde_json::from_slice(&bytes).context("Failed to decode cached RDAP JSON")?,
+            )),
+            None => Ok(None),
+        }
     }
 
     /// Insert or replace an IP-network cache entry, storing the RDAP range
@@ -295,16 +308,15 @@ impl Cache {
         let cache = self.clone();
         tokio::task::spawn_blocking(move || {
             let now = unix_now() as i64;
-            if let Ok(conn) = cache.conn().lock() {
-                let r = conn.execute(
-                    "INSERT OR REPLACE INTO rdap_cache \
-                     (key, payload, fetched_at, ttl, range_start, range_end) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![key, payload, now, ttl as i64, range_start, range_end],
-                );
-                if let Err(e) = r {
-                    eprintln!("cache: write error for '{key}': {e}");
-                }
+            let conn = cache.locked_conn();
+            let r = conn.execute(
+                "INSERT OR REPLACE INTO rdap_cache \
+                 (key, payload, fetched_at, ttl, range_start, range_end) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![key, payload, now, ttl as i64, range_start, range_end],
+            );
+            if let Err(e) = r {
+                eprintln!("cache: write error for '{key}': {e}");
             }
         })
     }
@@ -312,7 +324,7 @@ impl Cache {
     /// Delete all expired entries.  Call occasionally to reclaim disk space.
     pub fn evict_expired(&self) -> Result<usize> {
         let now = unix_now() as i64;
-        let conn = self.conn().lock().expect("cache mutex poisoned");
+        let conn = self.locked_conn();
         let n = conn.execute("DELETE FROM rdap_cache WHERE fetched_at + ttl <= ?1", [now])?;
         Ok(n)
     }

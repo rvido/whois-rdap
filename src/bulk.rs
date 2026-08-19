@@ -289,6 +289,13 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         loop {
             if let QueryState::Ready((ref initiator_key, ref res)) = *rx.borrow() {
                 // If it's an exact target match, we reuse the initiator's result (success or failure) directly.
+                //
+                // The `val.clone()` calls below are deliberate: each waiter
+                // needs its own owned `raw` for the public result structs.
+                // Sharing one allocation across waiters would mean changing
+                // `RdapResult::raw` and friends to `Arc<Value>` — a breaking
+                // API change whose payoff (RDAP documents are a few KB) does
+                // not currently justify it.
                 if cache_key == *initiator_key {
                     match res {
                         Ok(val) => match &target {
@@ -373,14 +380,20 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
 
     let result = match &target {
         QueryTarget::Ip(ip) => match client.lookup_ip(*ip).await {
-            Ok(res) => {
-                // Follow redirects
-                let (followed, _) =
-                    crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
-                        .await;
-                let res = if followed != res.raw {
+            Ok(mut res) => {
+                // Follow redirects. `raw` is moved in and handed back, and the
+                // returned href tells us whether a hop actually happened — so
+                // no full-document clone is needed to detect a change.
+                let (followed, followed_from) = crate::redirect::follow_links(
+                    &ctx.http,
+                    std::mem::take(&mut res.raw),
+                    ctx.max_redirects,
+                )
+                .await;
+                let res = if followed_from.is_some() {
                     crate::parse_ip_response(followed)
                 } else {
+                    res.raw = followed;
                     res
                 };
                 // Write cache — awaited so the write has landed before we
@@ -406,14 +419,18 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
             Err(e) => Err(e.to_string()),
         },
         QueryTarget::Domain(domain) => match client.lookup_domain(domain).await {
-            Ok(res) => {
-                // Follow redirects
-                let (followed, _) =
-                    crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
-                        .await;
-                let res = if followed != res.raw {
+            Ok(mut res) => {
+                // Follow redirects (see the Ip arm for why there is no clone).
+                let (followed, followed_from) = crate::redirect::follow_links(
+                    &ctx.http,
+                    std::mem::take(&mut res.raw),
+                    ctx.max_redirects,
+                )
+                .await;
+                let res = if followed_from.is_some() {
                     crate::parse_domain_response(domain, followed)
                 } else {
+                    res.raw = followed;
                     res
                 };
                 // Write cache — awaited, see comment above.
@@ -427,14 +444,18 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
             Err(e) => Err(e.to_string()),
         },
         QueryTarget::Asn(asn) => match client.lookup_asn(*asn).await {
-            Ok(res) => {
-                // Follow redirects — same as the Ip/Domain arms above.
-                let (followed, _) =
-                    crate::redirect::follow_links(&ctx.http, res.raw.clone(), ctx.max_redirects)
-                        .await;
-                let res = if followed != res.raw {
+            Ok(mut res) => {
+                // Follow redirects (see the Ip arm for why there is no clone).
+                let (followed, followed_from) = crate::redirect::follow_links(
+                    &ctx.http,
+                    std::mem::take(&mut res.raw),
+                    ctx.max_redirects,
+                )
+                .await;
+                let res = if followed_from.is_some() {
                     crate::parse_asn_response(*asn, followed)
                 } else {
+                    res.raw = followed;
                     res
                 };
                 // Write cache — awaited, see comment above.
@@ -449,27 +470,28 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         },
     };
 
-    // 4. Resolve our own return value
-    let record = match &result {
-        Ok(val) => match &target {
-            QueryTarget::Ip(_) => BulkRecord::Ip(raw, crate::parse_ip_response(val.clone())),
-            QueryTarget::Domain(domain) => {
-                BulkRecord::Domain(raw, crate::parse_domain_response(domain, val.clone()))
-            }
-            QueryTarget::Asn(asn) => {
-                BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, val.clone()))
-            }
-        },
-        Err(err) => BulkRecord::Error(raw, err.clone()),
-    };
-
-    // 5. Broadcast to waiters and clean up active map — only the initiator
-    // owns this group_key's entry (see comment at `is_initiator` above).
+    // 4. Broadcast to waiters and clean up the active map — only the initiator
+    // owns this group_key's entry (see the comment at `is_initiator` above).
+    //
+    // Done *before* building our own record so the payload only has to be
+    // cloned when someone else might actually read it: a task that never
+    // registered as initiator hands its value straight to `parse_*` below
+    // instead of cloning the whole document for a channel nobody is on.
     if is_initiator {
-        ctx.finish_query(&group_key, (cache_key, result));
+        ctx.finish_query(&group_key, (cache_key, result.clone()));
     }
 
-    record
+    // 5. Resolve our own return value, consuming `result`.
+    match result {
+        Ok(val) => match &target {
+            QueryTarget::Ip(_) => BulkRecord::Ip(raw, crate::parse_ip_response(val)),
+            QueryTarget::Domain(domain) => {
+                BulkRecord::Domain(raw, crate::parse_domain_response(domain, val))
+            }
+            QueryTarget::Asn(asn) => BulkRecord::Asn(*asn, crate::parse_asn_response(*asn, val)),
+        },
+        Err(err) => BulkRecord::Error(raw, err),
+    }
 }
 
 // ── Helper: read targets from a file or stdin ─────────────────────────────────

@@ -14,7 +14,6 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::net::IpAddr;
 
 /// Follow RDAP `links` in a response JSON up to `max_hops` times.
 ///
@@ -115,95 +114,29 @@ fn find_follow_href<'a>(json: &'a Value, self_href: Option<&str>) -> Option<&'a 
     })
 }
 
-/// Returns true if `ip` is a public, globally-routable address.
+/// Fetch an RDAP `links` href and decode the response as RDAP JSON.
 ///
-/// Excludes loopback, private (RFC 1918), link-local, carrier-grade NAT
-/// (RFC 6598), unique-local (IPv6 ULA), multicast, and unspecified ranges.
-fn is_globally_routable(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1])))
-        }
-        IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| !is_globally_routable(&IpAddr::V4(v4))))
-        }
-    }
-}
-
-/// Resolve `host` and confirm every candidate address is publicly routable.
-///
-/// Used to block SSRF via a `links` href pointing at internal
-/// infrastructure (e.g. a cloud metadata endpoint or localhost) — the RDAP
-/// server we followed a redirect from is not a trusted party.
-async fn host_is_safe(host: &str, port: u16) -> bool {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_globally_routable(&ip);
-    }
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
-            let mut saw_any = false;
-            for addr in addrs {
-                saw_any = true;
-                if !is_globally_routable(&addr.ip()) {
-                    return false;
-                }
-            }
-            saw_any
-        }
-        Err(_) => false,
-    }
-}
-
-/// Fetch a URL and decode the response as RDAP JSON.
+/// The href was supplied by a remote RDAP server, so it is untrusted: it must
+/// be HTTPS and resolve only to public addresses. `get_guarded` re-applies the
+/// same check to any HTTP redirect the target then issues.
 async fn fetch_href(http: &reqwest::Client, href: &str) -> Result<Value> {
     let url =
         reqwest::Url::parse(href).with_context(|| format!("Invalid redirect href: {href}"))?;
 
-    if url.scheme() != "https" {
-        return Err(anyhow::anyhow!(
-            "Refusing to follow non-https redirect: {href}"
-        ));
-    }
-    let host = url
-        .host_str()
-        .with_context(|| format!("Redirect href has no host: {href}"))?;
-    let port = url.port_or_known_default().unwrap_or(443);
-    if !host_is_safe(host, port).await {
-        return Err(anyhow::anyhow!(
-            "Refusing to follow redirect to non-public address: {href}"
-        ));
-    }
-
-    let resp = http
-        .get(url)
-        .header("Accept", "application/rdap+json, application/json")
-        .send()
+    crate::http::validate_untrusted_url(&url)
         .await
-        .with_context(|| format!("Failed to GET redirect: {href}"))?;
+        .with_context(|| format!("Refusing to follow redirect: {href}"))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
+    let fetched = crate::http::get_guarded(http, url, Some(crate::RDAP_ACCEPT)).await?;
+
+    if !fetched.status.is_success() {
+        let status = fetched.status;
         return Err(anyhow::anyhow!(
             "Redirect server returned {status} for {href}"
         ));
     }
 
-    resp.json::<Value>()
-        .await
+    serde_json::from_slice(&fetched.body)
         .with_context(|| format!("Failed to decode redirect JSON from {href}"))
 }
 
@@ -279,43 +212,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_globally_routable_rejects_private_and_special_ranges() {
-        let blocked = [
-            "127.0.0.1",        // loopback
-            "10.0.0.1",         // RFC 1918
-            "172.16.0.1",       // RFC 1918
-            "192.168.1.1",      // RFC 1918
-            "169.254.169.254",  // link-local / cloud metadata
-            "100.64.0.1",       // carrier-grade NAT
-            "0.0.0.0",          // unspecified
-            "::1",              // IPv6 loopback
-            "fe80::1",          // IPv6 link-local
-            "fc00::1",          // IPv6 unique-local
-            "::ffff:127.0.0.1", // IPv4-mapped loopback
-        ];
-        for ip in blocked {
-            let addr: IpAddr = ip.parse().unwrap();
-            assert!(!is_globally_routable(&addr), "{ip} should be blocked");
-        }
-    }
-
-    #[test]
-    fn test_is_globally_routable_allows_public_addresses() {
-        let allowed = ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"];
-        for ip in allowed {
-            let addr: IpAddr = ip.parse().unwrap();
-            assert!(is_globally_routable(&addr), "{ip} should be allowed");
-        }
-    }
-
     #[tokio::test]
     async fn test_fetch_href_rejects_non_https_scheme() {
         let http = crate::build_reqwest_client(std::time::Duration::from_secs(5)).unwrap();
         let err = fetch_href(&http, "http://example.com/rdap/domain/example.com")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("non-https"));
+        assert!(err.to_string().contains("Refusing to follow redirect"));
     }
 
     #[tokio::test]
@@ -324,7 +227,7 @@ mod tests {
         let err = fetch_href(&http, "https://169.254.169.254/latest/meta-data/")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("non-public"));
+        assert!(err.to_string().contains("Refusing to follow redirect"));
     }
 
     #[test]
