@@ -32,6 +32,11 @@ use std::net::IpAddr;
 /// misconfigured server, not to constrain legitimate traffic.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Upper bound on the pre-flight DNS resolution in `host_is_safe`. The system
+/// resolver has no timeout of its own that we control, and a hostile link
+/// can point at a name whose authoritative server never answers.
+pub(crate) const DNS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Maximum HTTP 3xx hops followed for a single logical request.
 pub(crate) const MAX_HTTP_REDIRECTS: usize = 5;
 
@@ -52,10 +57,17 @@ impl Fetched {
 /// Returns true if `ip` is a public, globally-routable address.
 ///
 /// Excludes loopback, private (RFC 1918), link-local, carrier-grade NAT
-/// (RFC 6598), unique-local (IPv6 ULA), multicast, and unspecified ranges.
+/// (RFC 6598), "this network" (0/8), IETF protocol assignments (192.0.0/24),
+/// benchmarking (198.18/15), documentation, reserved (240/4), multicast and
+/// broadcast; and for IPv6: unique-local, link- and site-local, multicast,
+/// documentation, discard-only, Teredo, deprecated IPv4-compatible
+/// addresses, and any IPv6 form that embeds an IPv4 address (IPv4-mapped,
+/// NAT64 64:ff9b::/96 and 64:ff9b:1::/48, 6to4 2002::/16) whose embedded
+/// address is itself not global — those are routed to that IPv4 address.
 pub(crate) fn is_globally_routable(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             !(v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
@@ -63,17 +75,42 @@ pub(crate) fn is_globally_routable(ip: &IpAddr) -> bool {
                 || v4.is_documentation()
                 || v4.is_unspecified()
                 || v4.is_multicast()
-                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1])))
+                || o[0] == 0                                   // 0.0.0.0/8
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64.0.0/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)     // 192.0.0.0/24
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)        // 198.18.0.0/15
+                || o[0] >= 240) // 240.0.0.0/4
         }
         IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                let [a, b] = hi.to_be_bytes();
+                let [c, d] = lo.to_be_bytes();
+                std::net::Ipv4Addr::new(a, b, c, d)
+            };
+            let global_v4 = |v4: std::net::Ipv4Addr| is_globally_routable(&IpAddr::V4(v4));
+
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return global_v4(v4); // ::ffff:a.b.c.d
+            }
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return global_v4(embedded(seg[6], seg[7])); // NAT64 well-known prefix
+            }
+            if seg[0] == 0x2002 {
+                return global_v4(embedded(seg[1], seg[2])); // 6to4
+            }
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| !is_globally_routable(&IpAddr::V4(v4))))
+                || seg[..6] == [0; 6]                          // ::/96 IPv4-compatible (deprecated)
+                || (seg[0] & 0xffc0) == 0xfe80                 // fe80::/10 link-local
+                || (seg[0] & 0xffc0) == 0xfec0                 // fec0::/10 site-local
+                || (seg[0] & 0xfe00) == 0xfc00                 // fc00::/7 unique-local
+                || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 1) // 64:ff9b:1::/48 local NAT64
+                || (seg[0] == 0x100 && seg[1..4] == [0; 3])   // 100::/64 discard-only
+                || (seg[0] == 0x2001 && seg[1] == 0)           // 2001::/32 Teredo
+                || (seg[0] == 0x2001 && seg[1] == 0xdb8)       // 2001:db8::/32 documentation
+                || (seg[0] == 0x3fff && seg[1] < 0x1000)) // 3fff::/20 documentation
         }
     }
 }
@@ -91,8 +128,8 @@ pub(crate) async fn host_is_safe(host: &str, port: u16) -> bool {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return is_globally_routable(&ip);
     }
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
+    match tokio::time::timeout(DNS_CHECK_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => {
             let mut saw_any = false;
             for addr in addrs {
                 saw_any = true;
@@ -102,7 +139,8 @@ pub(crate) async fn host_is_safe(host: &str, port: u16) -> bool {
             }
             saw_any
         }
-        Err(_) => false,
+        // Resolution failed or timed out: not provably safe.
+        Ok(Err(_)) | Err(_) => false,
     }
 }
 
@@ -211,17 +249,35 @@ mod tests {
     #[test]
     fn test_is_globally_routable_rejects_private_and_special_ranges() {
         let blocked = [
-            "127.0.0.1",        // loopback
-            "10.0.0.1",         // RFC 1918
-            "172.16.0.1",       // RFC 1918
-            "192.168.1.1",      // RFC 1918
-            "169.254.169.254",  // link-local / cloud metadata
-            "100.64.0.1",       // carrier-grade NAT
-            "0.0.0.0",          // unspecified
-            "::1",              // IPv6 loopback
-            "fe80::1",          // IPv6 link-local
-            "fc00::1",          // IPv6 unique-local
-            "::ffff:127.0.0.1", // IPv4-mapped loopback
+            "127.0.0.1",           // loopback
+            "10.0.0.1",            // RFC 1918
+            "172.16.0.1",          // RFC 1918
+            "192.168.1.1",         // RFC 1918
+            "169.254.169.254",     // link-local / cloud metadata
+            "100.64.0.1",          // carrier-grade NAT
+            "0.0.0.0",             // unspecified
+            "::1",                 // IPv6 loopback
+            "fe80::1",             // IPv6 link-local
+            "fc00::1",             // IPv6 unique-local
+            "::ffff:127.0.0.1",    // IPv4-mapped loopback
+            "0.1.2.3",             // "this network" 0/8
+            "192.0.0.8",           // IETF protocol assignments
+            "198.18.0.1",          // benchmarking
+            "198.19.255.255",      // benchmarking (upper half)
+            "240.0.0.1",           // reserved
+            "255.255.255.255",     // broadcast
+            "64:ff9b::a9fe:a9fe",  // NAT64 → 169.254.169.254
+            "64:ff9b::7f00:1",     // NAT64 → 127.0.0.1
+            "64:ff9b:1::1",        // local-use NAT64
+            "2002:a9fe:a9fe::1",   // 6to4 → 169.254.169.254
+            "2002:c0a8:0101::1",   // 6to4 → 192.168.1.1
+            "::127.0.0.1",         // IPv4-compatible
+            "2001:db8::1",         // documentation
+            "3fff::1",             // documentation
+            "2001:0:4136:e378::1", // Teredo
+            "100::1",              // discard-only
+            "fec0::1",             // site-local
+            "ff02::1",             // multicast
         ];
         for ip in blocked {
             let addr: IpAddr = ip.parse().unwrap();
@@ -231,7 +287,14 @@ mod tests {
 
     #[test]
     fn test_is_globally_routable_allows_public_addresses() {
-        for ip in ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"] {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "198.20.0.1", // just outside benchmarking /15
+            "2001:4860:4860::8888",
+            "64:ff9b::808:808", // NAT64 → 8.8.8.8
+            "2002:808:808::1",  // 6to4 → 8.8.8.8
+        ] {
             let addr: IpAddr = ip.parse().unwrap();
             assert!(is_globally_routable(&addr), "{ip} should be allowed");
         }

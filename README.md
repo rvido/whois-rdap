@@ -16,7 +16,7 @@ result cache, smart redirect following, and parallel bulk lookups — all with a
 |---|---|
 | **Auto-detect** | Query type is inferred from the input (IP / Domain / ASN) |
 | **IDN support** | Unicode domains are converted to punycode (`xn--...`) per RFC 7482 |
-| **Bootstrap triage** | Routes automatically to the correct RIR via IANA bootstrap maps (RFC 9224) |
+| **Bootstrap triage** | Routes IPs and ASNs to the correct RIR, and domains to their TLD registry, via IANA bootstrap maps (RFC 9224) |
 | **SQLite cache** | Avoids redundant lookups; TTL-based expiry per query type |
 | **Redirect following** | Chases RDAP `links` for richer sub-registry data (IP, Domain, and ASN) |
 | **SSRF hardening** | Server-chosen targets — RDAP `links` *and* HTTP 3xx hops — must be HTTPS and publicly routable; body size capped |
@@ -74,7 +74,7 @@ whois-rdap 8.8.8.8
 whois-rdap google.com
 
 # Unicode (IDN) domain — converted to punycode automatically
-whois-rdap münchen.de
+whois-rdap müller.com
 
 # Single ASN
 whois-rdap AS15169
@@ -114,7 +114,7 @@ Query type is auto-detected from the input:
 | `2001:4860:4860::8888` | IPv6 |
 | `AS15169` or `15169` | ASN |
 | `google.com` | Domain |
-| `münchen.de` | Domain (converted to `xn--mnchen-3ya.de`) |
+| `müller.com` | Domain (converted to `xn--mller-kva.com`) |
 
 ---
 
@@ -127,7 +127,7 @@ Query type is auto-detected from the input:
 | `[QUERY]...` | — | One or more targets (IP, domain, ASN) |
 | `--rir <NAME>` | — | Force a known registry: `ripe`, `arin`, `apnic`, `lacnic`, `afrinic`, `iana` |
 | `--server <URL>` | — | Custom RDAP server base URL (overrides `--rir` and bootstrap) |
-| `--timeout <SECS>` | `15` | Request timeout per lookup |
+| `--timeout <SECS>` | `15` | Timeout per HTTP request (min 1). Each target also has a total limit of 3× this, covering all redirects and link hops |
 | `--json` | off | Compact JSON output (NDJSON in bulk mode) |
 | `--list-servers` | — | Print all known servers and exit |
 
@@ -136,7 +136,7 @@ Query type is auto-detected from the input:
 | Flag | Default | Description |
 |---|---|---|
 | `--file <PATH>` | — | Read targets from file, one per line (use `-` for stdin) |
-| `--concurrency <N>` | `8` | Max in-flight lookups |
+| `--concurrency <N>` | `8` | Max in-flight lookups (1–1024) |
 
 Targets file format: one target per line; blank lines and `#` comments are
 ignored.
@@ -150,6 +150,14 @@ AS15169
 1.1.1.1     # Cloudflare
 ```
 
+Bulk mode writes one NDJSON line per target, failures included. The exit
+status is `1` if any lookup failed (the count is printed to stderr), `0`
+otherwise.
+
+Concurrent lookups that can share an answer are collapsed: identical targets
+always, and (with the cache enabled) IPs in the same /24 (IPv4) or /48 (IPv6),
+which are then answered from the first lookup's cached range.
+
 ### Bootstrap triage
 
 | Flag | Default | Description |
@@ -157,12 +165,18 @@ AS15169
 | `--no-bootstrap` | off | Disable IANA bootstrap; use `--rir` / `--server` explicitly |
 | `--refresh-bootstrap` | off | Force re-download of IANA bootstrap maps |
 
-Bootstrap maps are cached for **24 hours** per RFC 9224 at:
+Bootstrap maps (`ipv4.json`, `ipv6.json`, `asn.json`, `dns.json`) are cached
+for **24 hours** per RFC 9224 at:
 `$XDG_CACHE_HOME/whois-rdap/bootstrap/` (usually `~/.cache/whois-rdap/bootstrap/`).
 
 If a refresh fails but a cached copy exists, the stale copy is used and a
 warning is printed — losing the network degrades routing to "slightly out of
-date" rather than disabling bootstrap triage entirely.
+date" rather than disabling bootstrap triage entirely. A download is only
+saved after it parses, so a bad response never replaces a good copy.
+
+Some TLD registries (e.g. `.de`, `.ch`) publish no RDAP service. For those the
+tool prints a note and falls back to `rdap.iana.org`; pass `--server` if you
+know the registry's RDAP URL.
 
 ### Result cache
 
@@ -173,18 +187,27 @@ date" rather than disabling bootstrap triage entirely.
 | `--cache-ttl-domain <SECS>` | `28800` | TTL for domain results (8 h) |
 | `--cache-ttl-asn <SECS>` | `86400` | TTL for ASN results (24 h) |
 
+TTLs above 10 years are capped at 10 years. Expired entries are deleted each
+time the cache is opened, so `cache.db` does not grow without bound.
+
 **Why these TTLs?**
 - IP / ASN allocations are very stable — RIR databases rarely change within 24 h.
 - Domain registrations can change (registrar transfers, NS updates) — 8 h balances freshness vs. server load.
 
 Cache location: `$XDG_CACHE_HOME/whois-rdap/cache.db`
-(usually `~/.cache/whois-rdap/cache.db`)
+(usually `~/.cache/whois-rdap/cache.db`). With no usable `HOME`, a private
+per-user directory `$TMPDIR/whois-rdap-<uid>/` is used; it must be owned by
+you with mode `0700`, or caching and bootstrap are disabled.
+
+An IP result is stored as a *range* entry (answering later lookups for any
+address inside it) only when its `startAddress`–`endAddress` range actually
+contains the queried IP; otherwise it is cached for that exact IP only.
 
 ### Redirect following
 
 | Flag | Default | Description |
 |---|---|---|
-| `--max-redirects <N>` | `1` | RDAP link hops to follow (0 = off, max 3) |
+| `--max-redirects <N>` | `1` | RDAP link hops to follow (0–3) |
 
 RDAP responses sometimes include `links` arrays pointing to sub-registries
 with richer data. Setting `--max-redirects 1` (default) follows one hop;
@@ -194,8 +217,14 @@ For safety, any target chosen by a *remote server* — both an RDAP `links`
 href and an HTTP `Location:` redirect — is only followed when it is `https://`
 and resolves solely to public, globally-routable addresses. Loopback, RFC 1918
 private, link-local (including cloud metadata endpoints), carrier-grade NAT,
-and IPv6 unique-local/multicast targets are refused. This applies uniformly to
-IP, Domain, and ASN lookups.
+reserved/benchmarking ranges, IPv6 unique-local/multicast/documentation, and
+IPv6 forms that embed a non-public IPv4 address (NAT64, 6to4) are refused. A
+followed link must also describe the same kind of object (`objectClassName`)
+as the original answer. This applies uniformly to IP, Domain, and ASN lookups.
+
+Human-readable output replaces control characters and bidi overrides in
+server-supplied text with `�`, so a hostile server cannot inject terminal
+escape sequences. JSON output is escaped as usual.
 
 The URL *you* choose (`--server`, `--rir`, or a bootstrap entry) is exempt, so
 pointing the tool at an internal mirror or `http://localhost:8080` still works.
@@ -345,21 +374,35 @@ println!("{}", res.organization.unwrap_or_default());
 ### Parallel bulk lookup
 
 ```rust
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use whois_rdap::{RdapClient, RdapRegistry};
-use whois_rdap::bulk::bulk_lookup;
+use whois_rdap::bulk::{BulkContext, bulk_lookup};
+use whois_rdap::{RdapRegistry, build_reqwest_client};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let client = Arc::new(
-        RdapClient::for_registry(RdapRegistry::RIPE, Duration::from_secs(10))?
-    );
-    let targets = vec!["8.8.8.8".to_string(), "AS15169".to_string(), "google.com".to_string()];
+    let timeout = Duration::from_secs(10);
+    let ctx = Arc::new(BulkContext {
+        http: build_reqwest_client(timeout)?,
+        cache: None,
+        bootstrap: None,
+        timeout,
+        max_redirects: 1,
+        cache_ttl_ip: 86_400,
+        cache_ttl_domain: 28_800,
+        cache_ttl_asn: 86_400,
+        server: None,
+        rir: Some(RdapRegistry::RIPE),
+        active_queries: Mutex::new(HashMap::new()),
+    });
+    let targets = vec!["8.8.8.8".to_string(), "AS15169".to_string()];
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    bulk_lookup(client, targets.into_iter(), /* concurrency */ 4, &mut out).await?;
+    // Returns how many targets failed (each is also an NDJSON error line).
+    let failed = bulk_lookup(ctx, targets.into_iter(), /* concurrency */ 4, &mut out).await?;
+    eprintln!("{failed} failed");
     Ok(())
 }
 ```

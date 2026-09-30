@@ -31,6 +31,15 @@ pub const DEFAULT_TTL_IP_SECS: u64 = 86_400;
 pub const DEFAULT_TTL_DOMAIN_SECS: u64 = 28_800;
 /// Default TTL (seconds) for cached ASN lookup results: 24 hours.
 pub const DEFAULT_TTL_ASN_SECS: u64 = 86_400;
+/// Upper bound applied to every TTL (10 years). Larger values would overflow
+/// SQLite's signed 64-bit `fetched_at + ttl` (a `u64` over `i64::MAX` cast
+/// with `as` goes negative, so the entry would be born expired).
+pub const MAX_TTL_SECS: u64 = 10 * 365 * 86_400;
+
+/// TTL as stored in SQLite: clamped to `MAX_TTL_SECS`, so it always fits.
+fn db_ttl(ttl: u64) -> i64 {
+    ttl.min(MAX_TTL_SECS) as i64
+}
 
 // ── Cache key helpers ─────────────────────────────────────────────────────────
 
@@ -75,13 +84,22 @@ pub struct Cache {
 
 impl Cache {
     /// Open (or create) the on-disk cache at the default XDG path.
+    ///
+    /// Also deletes expired entries, so the database does not grow without
+    /// bound. Eviction is best-effort: a failure (e.g. another process holds
+    /// the write lock past the busy timeout) is reported and the cache is
+    /// still returned.
     pub fn open() -> Result<Self> {
         let path = cache_db_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Cannot create cache dir: {}", parent.display()))?;
         }
-        Self::open_at(path)
+        let cache = Self::open_at(path)?;
+        if let Err(e) = cache.evict_expired() {
+            eprintln!("cache: could not evict expired entries ({e:#})");
+        }
+        Ok(cache)
     }
 
     /// Open a cache at an explicit path.  Use `":memory:"` in tests.
@@ -184,7 +202,7 @@ impl Cache {
             let r = conn.execute(
                 "INSERT OR REPLACE INTO rdap_cache (key, payload, fetched_at, ttl) \
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![key, payload, now, ttl as i64],
+                rusqlite::params![key, payload, now, db_ttl(ttl)],
             );
             if let Err(e) = r {
                 eprintln!("cache: write error for '{key}': {e}");
@@ -313,7 +331,7 @@ impl Cache {
                 "INSERT OR REPLACE INTO rdap_cache \
                  (key, payload, fetched_at, ttl, range_start, range_end) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![key, payload, now, ttl as i64, range_start, range_end],
+                rusqlite::params![key, payload, now, db_ttl(ttl), range_start, range_end],
             );
             if let Err(e) = r {
                 eprintln!("cache: write error for '{key}': {e}");
@@ -458,6 +476,23 @@ mod tests {
     }
 
     // ── Basic get/miss ────────────────────────────────────────────────────────
+
+    /// Regression: a TTL above i64::MAX used to be cast with `as i64`, went
+    /// negative, and the entry was expired the moment it was written.
+    #[tokio::test]
+    async fn test_huge_ttl_is_clamped_not_wrapped() {
+        let cache = Cache::open_at(":memory:").unwrap();
+        cache
+            .insert_background("asn:1".into(), &json!({"x": 1}), u64::MAX)
+            .await
+            .unwrap();
+        assert!(
+            cache.get("asn:1").unwrap().is_some(),
+            "huge TTL must still be a hit"
+        );
+        assert_eq!(db_ttl(u64::MAX), MAX_TTL_SECS as i64);
+        assert_eq!(db_ttl(60), 60);
+    }
 
     #[test]
     fn test_miss_on_empty_cache() {

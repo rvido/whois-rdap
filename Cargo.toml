@@ -12,6 +12,7 @@ clap = { version = "4.6", default-features = false, features = [
     "help",
     "usage",
     "derive",
+    "error-context",    # "invalid value '0' for '--concurrency'", not a bare "invalid value"
 ] }
 
 # default-features = false drops: charset (encoding_rs), http2 (h2), cookies,
@@ -41,6 +42,7 @@ tokio = { version = "1.52", default-features = false, features = [
     "io-util",          # AsyncBufReadExt
     "sync",             # Mutex for cache connection
     "net",              # lookup_host: SSRF guard for redirect-following
+    "time",             # per-target deadline and DNS-check timeout
 ] }
 
 # Feature 2 — IANA bootstrap triage
@@ -63,6 +65,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Feature 1 — parallel bulk streaming via buffer_unordered
 futures = { version = "0.3", default-features = false, features = ["std"] }
+
+# geteuid() for the private temp-dir cache fallback (see default_cache_base).
+# Already in the dependency graph via tokio/mio, so this adds no new code.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = true

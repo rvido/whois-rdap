@@ -109,12 +109,16 @@ impl BulkRecord {
 /// * `writer`      — output sink; receives one JSON line per result
 ///
 /// Results are emitted in completion order (fastest first).
+///
+/// Returns the number of targets whose lookup failed (each also emitted as an
+/// `{"query":..,"error":..}` line), so callers can set an exit status.
+/// A `concurrency` of 0 is treated as 1.
 pub async fn bulk_lookup<I, W>(
     ctx: Arc<BulkContext>,
     targets: I,
     concurrency: usize,
     writer: &mut W,
-) -> Result<()>
+) -> Result<usize>
 where
     I: Iterator<Item = String>,
     W: Write,
@@ -123,17 +127,23 @@ where
         let ctx = Arc::clone(&ctx);
         async move { lookup_one(&ctx, raw).await }
     }))
-    .buffer_unordered(concurrency);
+    // buffer_unordered(0) never polls anything and the stream hangs forever.
+    .buffer_unordered(concurrency.max(1));
 
     tokio::pin!(stream);
 
+    let mut failures = 0usize;
     while let Some(record) = stream.next().await {
+        if matches!(record, BulkRecord::Error(..)) {
+            failures += 1;
+        }
         let line = record.to_ndjson();
         writer.write_all(&line)?;
         writer.write_all(b"\n")?;
     }
+    writer.flush()?;
 
-    Ok(())
+    Ok(failures)
 }
 
 impl BulkContext {
@@ -184,43 +194,31 @@ impl<'a> Drop for ActiveQueryGuard<'a> {
 
 /// Group key used to collapse concurrent lookups via SingleFlight.
 ///
-/// For IPs, prefers the real delegation boundary from the IANA bootstrap map
-/// (e.g. a whole `20.0.0.0/8` RIR block) when available — far more accurate
-/// than a fixed-width guess, since real allocations are often wider than a
-/// /16 (or narrower). Falls back to a fixed /16 (v4) / /48 (v6) heuristic
-/// when no bootstrap map was loaded (`--no-bootstrap`) or the address isn't
-/// covered by it.
-fn get_group_key(
-    target: &QueryTarget,
-    bootstrap: Option<&crate::bootstrap::BootstrapMap>,
-) -> String {
+/// A waiter holds one of the `concurrency` slots while it waits, so grouping
+/// only pays off when the leader's answer is likely to serve the waiter too:
+///
+/// * Without a cache, a waiter can only reuse an *identical* query's result
+///   (a different IP can't be answered from the leader's range), so the
+///   group is the exact target.
+/// * With a cache, IPs group by /24 (v4) or /48 (v6): the leader's range
+///   entry almost always covers the whole /24, so waiters are answered from
+///   the cache. (Grouping by the bootstrap delegation — often a whole /8 —
+///   made most of a large batch queue behind one leader per RIR block, then
+///   run their own lookups anyway.) IPs in the same allocation but a
+///   different /24 still get the cached range once the first lookup lands.
+fn get_group_key(target: &QueryTarget, cache_enabled: bool) -> String {
     match target {
-        QueryTarget::Ip(ip) => {
-            if let Some(net) = bootstrap.and_then(|b| b.find_ip_prefix(*ip)) {
-                return format!("group:ip:{net}");
-            }
-            match ip {
-                IpAddr::V4(ipv4) => {
-                    let octets = ipv4.octets();
-                    // Group by /16 to collapse queries within the same broad provider block
-                    format!("group:ipv4:{}.{}", octets[0], octets[1])
-                }
-                IpAddr::V6(ipv6) => {
-                    let segments = ipv6.segments();
-                    // Group by /48 for IPv6
-                    format!(
-                        "group:ipv6:{:x}:{:x}:{:x}",
-                        segments[0], segments[1], segments[2]
-                    )
-                }
-            }
+        QueryTarget::Ip(ip) if !cache_enabled => format!("group:ip:{ip}"),
+        QueryTarget::Ip(IpAddr::V4(ipv4)) => {
+            let o = ipv4.octets();
+            format!("group:ipv4:{}.{}.{}", o[0], o[1], o[2])
         }
-        QueryTarget::Domain(domain) => {
-            format!("group:domain:{}", domain)
+        QueryTarget::Ip(IpAddr::V6(ipv6)) => {
+            let seg = ipv6.segments();
+            format!("group:ipv6:{:x}:{:x}:{:x}", seg[0], seg[1], seg[2])
         }
-        QueryTarget::Asn(asn) => {
-            format!("group:asn:{}", asn)
-        }
+        QueryTarget::Domain(domain) => format!("group:domain:{domain}"),
+        QueryTarget::Asn(asn) => format!("group:asn:{asn}"),
     }
 }
 
@@ -231,7 +229,7 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         QueryTarget::Domain(domain) => crate::cache::key_domain(domain),
         QueryTarget::Asn(asn) => crate::cache::key_asn(*asn),
     };
-    let group_key = get_group_key(&target, ctx.bootstrap.as_deref());
+    let group_key = get_group_key(&target, ctx.cache.is_some());
 
     // 1. Cache hit path (IP range-aware, domain/ASN exact match)
     if let Some(ref cache) = ctx.cache {
@@ -370,7 +368,7 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
     let client = match RdapClient::for_custom_with_client(&base_url, ctx.http.clone()) {
         Ok(c) => c,
         Err(e) => {
-            let err_msg = e.to_string();
+            let err_msg = format!("{e:#}");
             if is_initiator {
                 ctx.finish_query(&group_key, (cache_key.clone(), Err(err_msg.clone())));
             }
@@ -378,96 +376,107 @@ async fn lookup_one(ctx: &BulkContext, raw: String) -> BulkRecord {
         }
     };
 
+    // Bounds the whole lookup, including HTTP redirects and RDAP link hops.
+    let deadline = crate::lookup_deadline(ctx.timeout);
     let result = match &target {
-        QueryTarget::Ip(ip) => match client.lookup_ip(*ip).await {
-            Ok(mut res) => {
-                // Follow redirects. `raw` is moved in and handed back, and the
-                // returned href tells us whether a hop actually happened — so
-                // no full-document clone is needed to detect a change.
-                let (followed, followed_from) = crate::redirect::follow_links(
-                    &ctx.http,
-                    std::mem::take(&mut res.raw),
-                    ctx.max_redirects,
-                )
-                .await;
-                let res = if followed_from.is_some() {
-                    crate::parse_ip_response(followed)
-                } else {
-                    res.raw = followed;
-                    res
-                };
-                // Write cache — awaited so the write has landed before we
-                // broadcast completion (step 5), otherwise waiters that
-                // re-check the cache immediately after being woken can race
-                // ahead of this still-in-flight spawn_blocking write and see
-                // a spurious miss.
-                if let Some(ref cache) = ctx.cache {
-                    let range_bounds = res.range.as_ref().and_then(|(s, e)| {
-                        Some((s.parse::<IpAddr>().ok()?, e.parse::<IpAddr>().ok()?))
-                    });
-                    let _ = cache
-                        .insert_ip_background(
-                            cache_key.clone(),
-                            &res.raw,
-                            range_bounds,
-                            ctx.cache_ttl_ip,
-                        )
-                        .await;
+        QueryTarget::Ip(ip) => {
+            match crate::within_deadline(deadline, client.lookup_ip(*ip)).await {
+                Ok(mut res) => {
+                    // Follow redirects. `raw` is moved in and handed back, and the
+                    // returned href tells us whether a hop actually happened — so
+                    // no full-document clone is needed to detect a change.
+                    let (followed, followed_from) = crate::redirect::follow_links_until(
+                        &ctx.http,
+                        std::mem::take(&mut res.raw),
+                        ctx.max_redirects,
+                        Some(deadline),
+                    )
+                    .await;
+                    let res = if followed_from.is_some() {
+                        crate::parse_ip_response(followed)
+                    } else {
+                        res.raw = followed;
+                        res
+                    };
+                    // Write cache — awaited so the write has landed before we
+                    // broadcast completion (step 5), otherwise waiters that
+                    // re-check the cache immediately after being woken can race
+                    // ahead of this still-in-flight spawn_blocking write and see
+                    // a spurious miss.
+                    if let Some(ref cache) = ctx.cache {
+                        // Only a range that really contains the queried IP may
+                        // answer future lookups for other IPs in it.
+                        let range_bounds = crate::cacheable_ip_range(*ip, &res);
+                        let _ = cache
+                            .insert_ip_background(
+                                cache_key.clone(),
+                                &res.raw,
+                                range_bounds,
+                                ctx.cache_ttl_ip,
+                            )
+                            .await;
+                    }
+                    Ok(res.raw)
                 }
-                Ok(res.raw)
+                Err(e) => Err(format!("{e:#}")),
             }
-            Err(e) => Err(e.to_string()),
-        },
-        QueryTarget::Domain(domain) => match client.lookup_domain(domain).await {
-            Ok(mut res) => {
-                // Follow redirects (see the Ip arm for why there is no clone).
-                let (followed, followed_from) = crate::redirect::follow_links(
-                    &ctx.http,
-                    std::mem::take(&mut res.raw),
-                    ctx.max_redirects,
-                )
-                .await;
-                let res = if followed_from.is_some() {
-                    crate::parse_domain_response(domain, followed)
-                } else {
-                    res.raw = followed;
-                    res
-                };
-                // Write cache — awaited, see comment above.
-                if let Some(ref cache) = ctx.cache {
-                    let _ = cache
-                        .insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_domain)
-                        .await;
+        }
+        QueryTarget::Domain(domain) => {
+            match crate::within_deadline(deadline, client.lookup_domain(domain)).await {
+                Ok(mut res) => {
+                    // Follow redirects (see the Ip arm for why there is no clone).
+                    let (followed, followed_from) = crate::redirect::follow_links_until(
+                        &ctx.http,
+                        std::mem::take(&mut res.raw),
+                        ctx.max_redirects,
+                        Some(deadline),
+                    )
+                    .await;
+                    let res = if followed_from.is_some() {
+                        crate::parse_domain_response(domain, followed)
+                    } else {
+                        res.raw = followed;
+                        res
+                    };
+                    // Write cache — awaited, see comment above.
+                    if let Some(ref cache) = ctx.cache {
+                        let _ = cache
+                            .insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_domain)
+                            .await;
+                    }
+                    Ok(res.raw)
                 }
-                Ok(res.raw)
+                Err(e) => Err(format!("{e:#}")),
             }
-            Err(e) => Err(e.to_string()),
-        },
-        QueryTarget::Asn(asn) => match client.lookup_asn(*asn).await {
-            Ok(mut res) => {
-                // Follow redirects (see the Ip arm for why there is no clone).
-                let (followed, followed_from) = crate::redirect::follow_links(
-                    &ctx.http,
-                    std::mem::take(&mut res.raw),
-                    ctx.max_redirects,
-                )
-                .await;
-                let res = if followed_from.is_some() {
-                    crate::parse_asn_response(*asn, followed)
-                } else {
-                    res.raw = followed;
-                    res
-                };
-                // Write cache — awaited, see comment above.
-                if let Some(ref cache) = ctx.cache {
-                    let _ = cache
-                        .insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_asn)
-                        .await;
+        }
+        QueryTarget::Asn(asn) => {
+            match crate::within_deadline(deadline, client.lookup_asn(*asn)).await {
+                Ok(mut res) => {
+                    // Follow redirects (see the Ip arm for why there is no clone).
+                    let (followed, followed_from) = crate::redirect::follow_links_until(
+                        &ctx.http,
+                        std::mem::take(&mut res.raw),
+                        ctx.max_redirects,
+                        Some(deadline),
+                    )
+                    .await;
+                    let res = if followed_from.is_some() {
+                        crate::parse_asn_response(*asn, followed)
+                    } else {
+                        res.raw = followed;
+                        res
+                    };
+                    // Write cache — awaited, see comment above.
+                    if let Some(ref cache) = ctx.cache {
+                        let _ = cache
+                            .insert_background(cache_key.clone(), &res.raw, ctx.cache_ttl_asn)
+                            .await;
+                    }
+                    Ok(res.raw)
                 }
-                Ok(res.raw)
+                Err(e) => Err(format!("{e:#}")),
             }
-            Err(e) => Err(e.to_string()),
-        },
+        }
     };
 
     // 4. Broadcast to waiters and clean up the active map — only the initiator
@@ -984,6 +993,22 @@ mod tests {
             .unwrap();
 
         assert!(output.is_empty(), "No targets must produce no output");
+    }
+
+    #[test]
+    fn test_group_key_is_exact_without_cache_and_slash24_with_cache() {
+        let a = classify_query("20.1.2.3");
+        let b = classify_query("20.1.2.200");
+        let c = classify_query("20.1.3.1");
+        // No cache: different IPs never wait on each other.
+        assert_ne!(get_group_key(&a, false), get_group_key(&b, false));
+        assert_eq!(get_group_key(&a, false), get_group_key(&a, false));
+        // Cache: same /24 groups, different /24 does not.
+        assert_eq!(get_group_key(&a, true), get_group_key(&b, true));
+        assert_ne!(get_group_key(&a, true), get_group_key(&c, true));
+        let v6a = classify_query("2001:4860:4860::8888");
+        let v6b = classify_query("2001:4860:4860:1::1");
+        assert_eq!(get_group_key(&v6a, true), get_group_key(&v6b, true));
     }
 
     #[tokio::test]

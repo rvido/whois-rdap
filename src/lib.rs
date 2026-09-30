@@ -52,6 +52,29 @@ pub fn build_reqwest_client(timeout: Duration) -> Result<reqwest::Client> {
         .build()?)
 }
 
+/// Total time budget for one target, as a multiple of the per-request
+/// `--timeout`. One logical lookup can involve several HTTP requests (up to
+/// `http::MAX_HTTP_REDIRECTS` 3xx hops, then up to 3 RDAP link hops, each
+/// with its own redirects), so the per-request timeout alone does not bound
+/// how long a target can take.
+pub const TOTAL_TIMEOUT_FACTOR: u32 = 3;
+
+/// Deadline for one target's lookup, starting now. See `TOTAL_TIMEOUT_FACTOR`.
+pub fn lookup_deadline(per_request_timeout: Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + per_request_timeout.saturating_mul(TOTAL_TIMEOUT_FACTOR)
+}
+
+/// Run `fut`, failing with a clear error if `deadline` passes first.
+pub async fn within_deadline<T>(
+    deadline: tokio::time::Instant,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout_at(deadline, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("lookup exceeded its total time limit")),
+    }
+}
+
 /// A classified RDAP query target — an IP address, ASN, or domain name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryTarget {
@@ -127,7 +150,7 @@ pub fn resolve_base_url(
         let found = match target {
             QueryTarget::Ip(ip) => map.find_ip(*ip),
             QueryTarget::Asn(asn) => map.find_asn(*asn),
-            QueryTarget::Domain(_) => None, // Domain bootstrap not in scope
+            QueryTarget::Domain(domain) => map.find_domain(domain),
         };
         if let Some(url) = found {
             return url.to_string();
@@ -142,6 +165,11 @@ pub fn resolve_base_url(
 
 /// Resolve the default base cache directory for the process, accounting for
 /// custom environments, missing/fallback HOME, or embedded devices.
+///
+/// Both the result cache and the bootstrap maps live here, and bootstrap URLs
+/// are trusted (they are exempt from the SSRF guard), so this directory must
+/// never be writable by another user. In particular root (HOME=/root) uses
+/// `/root/.cache` like everyone else — never the shared temp directory.
 pub(crate) fn default_cache_base() -> Result<std::path::PathBuf> {
     use std::path::PathBuf;
 
@@ -156,13 +184,65 @@ pub(crate) fn default_cache_base() -> Result<std::path::PathBuf> {
     // 2. Check HOME env var.
     if let Some(home) = std::env::var_os("HOME") {
         let home_path = PathBuf::from(home);
-        if !home_path.as_os_str().is_empty() && home_path != *"/root" && home_path != *"/" {
+        if !home_path.as_os_str().is_empty() && home_path != *"/" {
             return Ok(home_path.join(".cache").join("whois-rdap"));
         }
     }
 
-    // 3. Safe fallback for embedded devices, root execution, or container environments.
-    // std::env::temp_dir() is universally writable and available (e.g. /tmp on Linux).
+    // 3. Fallback for environments with no usable HOME (embedded devices,
+    //    some containers): a per-user directory in the shared temp dir,
+    //    verified to be private to us.
+    private_temp_cache_dir()
+}
+
+/// Create (or validate) `$TMPDIR/whois-rdap-<euid>`: a real directory (not a
+/// symlink), owned by the current user, with no group/other permissions.
+///
+/// Anyone can create entries in the shared temp dir, so another local user
+/// could pre-create this path to plant bootstrap maps (redirecting our
+/// lookups) or cache entries (forging results). Refuse anything we don't own.
+#[cfg(unix)]
+fn private_temp_cache_dir() -> Result<std::path::PathBuf> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let dir = std::env::temp_dir().join(format!("whois-rdap-{euid}"));
+    ensure_private_dir(&dir, euid)?;
+    Ok(dir)
+}
+
+/// Create `dir` with mode 0700 if missing, then verify it is a real directory
+/// owned by `euid` with no group/other permission bits.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &std::path::Path, euid: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("Cannot create cache dir: {}", dir.display()));
+        }
+    }
+    let meta = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("Cannot stat cache dir: {}", dir.display()))?;
+    if !meta.file_type().is_dir() || meta.uid() != euid {
+        return Err(anyhow!(
+            "refusing cache dir {}: not a directory owned by uid {euid}",
+            dir.display()
+        ));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(anyhow!(
+            "refusing cache dir {}: accessible by other users (mode {:o})",
+            dir.display(),
+            meta.permissions().mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_temp_cache_dir() -> Result<std::path::PathBuf> {
     Ok(std::env::temp_dir().join("whois-rdap"))
 }
 
@@ -212,10 +292,10 @@ impl FromStr for RdapRegistry {
 
 impl RdapRegistry {
     /// Base URL for the registry (no trailing slash).
-    pub fn base_url(self) -> &'static str {
+    pub const fn base_url(self) -> &'static str {
         match self {
             RdapRegistry::RIPE => "https://rdap.db.ripe.net",
-            RdapRegistry::ARIN => "https://rdap.arin.net/rdap",
+            RdapRegistry::ARIN => "https://rdap.arin.net/registry",
             RdapRegistry::APNIC => "https://rdap.apnic.net",
             RdapRegistry::LACNIC => "https://rdap.lacnic.net/rdap",
             RdapRegistry::AFRINIC => "https://rdap.afrinic.net/rdap",
@@ -224,7 +304,7 @@ impl RdapRegistry {
     }
 
     /// A user-friendly label.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             RdapRegistry::RIPE => "RIPE NCC",
             RdapRegistry::ARIN => "ARIN",
@@ -236,27 +316,22 @@ impl RdapRegistry {
     }
 
     /// List all registries with their labels and base URLs.
+    ///
+    /// Built from `label()` / `base_url()` so the listing can never drift from
+    /// the URLs actually queried.
     pub fn all() -> &'static [(RdapRegistry, &'static str, &'static str)] {
-        &[
-            (RdapRegistry::RIPE, "RIPE NCC", "https://rdap.db.ripe.net"),
-            (RdapRegistry::ARIN, "ARIN", "https://rdap.arin.net/rdap"),
-            (RdapRegistry::APNIC, "APNIC", "https://rdap.apnic.net"),
-            (
-                RdapRegistry::LACNIC,
-                "LACNIC",
-                "https://rdap.lacnic.net/rdap",
-            ),
-            (
-                RdapRegistry::AFRINIC,
-                "AFRINIC",
-                "https://rdap.afrinic.net/rdap",
-            ),
-            (
-                RdapRegistry::IANA,
-                "IANA (bootstrap)",
-                "https://rdap.iana.org",
-            ),
-        ]
+        const fn entry(r: RdapRegistry) -> (RdapRegistry, &'static str, &'static str) {
+            (r, r.label(), r.base_url())
+        }
+        const ALL: [(RdapRegistry, &str, &str); 6] = [
+            entry(RdapRegistry::RIPE),
+            entry(RdapRegistry::ARIN),
+            entry(RdapRegistry::APNIC),
+            entry(RdapRegistry::LACNIC),
+            entry(RdapRegistry::AFRINIC),
+            entry(RdapRegistry::IANA),
+        ];
+        &ALL
     }
 }
 
@@ -476,6 +551,50 @@ pub fn parse_asn_response(asn: u32, json: Value) -> RdapAsnResult {
     }
 }
 
+/// Make server-supplied text safe to print on a terminal.
+///
+/// RDAP data comes from remote (possibly hostile) servers. Printed raw, it
+/// could carry ANSI/OSC escape sequences (recolour or rewrite the terminal,
+/// set the window title, inject fake lines) or Unicode bidi overrides that
+/// make text display differently from what it is. Every control character
+/// (C0, DEL, C1 — including newline) and every bidi override/isolate is
+/// replaced with U+FFFD. Borrowed unchanged in the common all-clean case.
+///
+/// Only for human-readable output: JSON output is already escaped by serde.
+pub fn sanitize_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
+    fn bad(c: char) -> bool {
+        c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    }
+    if s.chars().any(bad) {
+        std::borrow::Cow::Owned(
+            s.chars()
+                .map(|c| if bad(c) { '\u{FFFD}' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Allocation bounds from `res` that are safe to store as a range cache entry
+/// for a lookup of `ip`.
+///
+/// A range entry answers future lookups for *every* address inside it, so it
+/// is only trusted when the response actually describes `ip`: both bounds
+/// parse, are the same address family as `ip`, are ordered, and contain `ip`.
+/// Anything else (a malformed or hostile server, or a followed link that
+/// described some other network) is cached by exact key only.
+pub fn cacheable_ip_range(ip: IpAddr, res: &RdapResult) -> Option<(IpAddr, IpAddr)> {
+    let (s, e) = res.range.as_ref()?;
+    let start: IpAddr = s.trim().parse().ok()?;
+    let end: IpAddr = e.trim().parse().ok()?;
+    let same_family = |a: &IpAddr| a.is_ipv4() == ip.is_ipv4();
+    if !(same_family(&start) && same_family(&end)) {
+        return None;
+    }
+    (start <= ip && ip <= end).then_some((start, end))
+}
+
 /* --------------------------- Helpers & extractors -------------------------- */
 
 fn trim_trailing_slash(s: &str) -> &str {
@@ -546,92 +665,57 @@ fn extract_asn_range(root: &Value) -> Option<(u32, u32)> {
 /// Looks for AS numbers in autnums field or entity references.
 fn extract_as_number(root: &Value) -> Option<u32> {
     // Check for arin_originas0_originautnums (ARIN specific)
-    if let Some(origin_autnums) = root
+    if let Some(n) = root
         .get("arin_originas0_originautnums")
         .and_then(|v| v.as_array())
+        .and_then(|arr| arr.iter().find_map(as_number_value))
     {
-        for autnum in origin_autnums {
-            let parsed_num = autnum.as_u64().or_else(|| {
-                autnum
-                    .as_str()
-                    .and_then(|s| parse_as_number(s).map(|n| n as u64))
-            });
-            if let Some(as_num) = parsed_num {
-                return Some(as_num as u32);
-            }
-        }
+        return Some(n);
     }
 
     // Check for cidr0_cidrs with AS number information
-    if let Some(cidrs) = root.get("cidr0_cidrs").and_then(|v| v.as_array()) {
-        for cidr in cidrs {
-            let parsed_num = cidr.get("autnum").and_then(|v| {
-                v.as_u64().or_else(|| {
-                    v.as_str()
-                        .and_then(|s| parse_as_number(s).map(|n| n as u64))
-                })
-            });
-            if let Some(as_num) = parsed_num {
-                return Some(as_num as u32);
-            }
-        }
+    if let Some(n) = root
+        .get("cidr0_cidrs")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find_map(|cidr| cidr.get("autnum").and_then(as_number_value))
+        })
+    {
+        return Some(n);
     }
 
     // First check if there's an "autnums" field directly
-    if let Some(autnums) = root.get("autnums").and_then(|v| v.as_array()) {
-        for autnum in autnums {
-            if let Some(parsed) = autnum
-                .get("handle")
-                .and_then(|h| h.as_str())
-                .and_then(parse_as_number)
-            {
-                return Some(parsed);
-            }
-            // Also check the startAutnum field which contains the actual AS number
-            let parsed_num = autnum.get("startAutnum").and_then(|v| {
-                v.as_u64().or_else(|| {
-                    v.as_str()
-                        .and_then(|s| parse_as_number(s).map(|n| n as u64))
-                })
-            });
-            if let Some(as_num) = parsed_num {
-                return Some(as_num as u32);
-            }
-        }
+    if let Some(n) = root
+        .get("autnums")
+        .and_then(|v| v.as_array())
+        .and_then(|autnums| autnums.iter().find_map(autnum_object_number))
+    {
+        return Some(n);
     }
 
     // Check in entities for AS number references
     if let Some(entities) = root.get("entities").and_then(|v| v.as_array()) {
         for entity in entities {
-            // Check handle field for AS numbers (format like "AS1234")
+            // An entity handle is normally a contact/org ID ("GOGL",
+            // "ORG-123-RIPE", "12345-ARIN" …); only an explicit "AS<digits>"
+            // handle names an AS. Accepting bare leading digits here turned
+            // numeric contact IDs into bogus AS numbers.
             if let Some(parsed) = entity
                 .get("handle")
                 .and_then(|h| h.as_str())
-                .and_then(parse_as_number)
+                .and_then(parse_as_handle)
             {
                 return Some(parsed);
             }
 
             // Check if entity has autnums
-            if let Some(autnums) = entity.get("autnums").and_then(|v| v.as_array()) {
-                for autnum in autnums {
-                    if let Some(parsed) = autnum
-                        .get("handle")
-                        .and_then(|h| h.as_str())
-                        .and_then(parse_as_number)
-                    {
-                        return Some(parsed);
-                    }
-                    let parsed_num = autnum.get("startAutnum").and_then(|v| {
-                        v.as_u64().or_else(|| {
-                            v.as_str()
-                                .and_then(|s| parse_as_number(s).map(|n| n as u64))
-                        })
-                    });
-                    if let Some(as_num) = parsed_num {
-                        return Some(as_num as u32);
-                    }
-                }
+            if let Some(n) = entity
+                .get("autnums")
+                .and_then(|v| v.as_array())
+                .and_then(|autnums| autnums.iter().find_map(autnum_object_number))
+            {
+                return Some(n);
             }
 
             // Recursively check nested entities
@@ -640,7 +724,7 @@ fn extract_as_number(root: &Value) -> Option<u32> {
                     if let Some(parsed) = nested_entity
                         .get("handle")
                         .and_then(|h| h.as_str())
-                        .and_then(parse_as_number)
+                        .and_then(parse_as_handle)
                     {
                         return Some(parsed);
                     }
@@ -668,6 +752,25 @@ fn extract_as_number(root: &Value) -> Option<u32> {
     None
 }
 
+/// An AS number given as a JSON number or string ("15169" / "AS15169").
+/// Numbers outside the 32-bit ASN space are rejected, never truncated.
+fn as_number_value(v: &Value) -> Option<u32> {
+    match v {
+        Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+        Value::String(s) => parse_as_number(s),
+        _ => None,
+    }
+}
+
+/// AS number from an RDAP autnum object: its "AS…" handle, else `startAutnum`.
+fn autnum_object_number(autnum: &Value) -> Option<u32> {
+    autnum
+        .get("handle")
+        .and_then(|h| h.as_str())
+        .and_then(parse_as_number)
+        .or_else(|| autnum.get("startAutnum").and_then(as_number_value))
+}
+
 /// Parse AS number from strings like "AS1234", "1234", etc.
 fn parse_as_number(s: &str) -> Option<u32> {
     let s = s.trim();
@@ -688,23 +791,43 @@ fn parse_as_number(s: &str) -> Option<u32> {
     }
 }
 
-/// Extract AS number from text descriptions
+/// Strict form for entity handles: must be "AS<digits>", optionally followed
+/// by a non-alphanumeric suffix ("AS15169-ARIN"). "12345-ARIN" or "ASTRA" is
+/// not an AS number.
+fn parse_as_handle(s: &str) -> Option<u32> {
+    let rest = s.trim().strip_prefix("AS")?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if end == 0 || rest[end..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    rest[..end].parse().ok()
+}
+
+/// Extract AS number from text descriptions.
+///
+/// "AS" must start a word ("originated by AS15169", "(AS15169)"), so words
+/// like "GAS12" or "CLASS3" are not read as AS numbers.
 fn extract_as_from_text(text: &str) -> Option<u32> {
-    let mut rest = text;
-    while let Some(idx) = rest.find("AS") {
-        let stripped = &rest[idx + 2..];
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find("AS") {
+        let idx = search_from + rel;
+        let starts_word = text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let stripped = &text[idx + 2..];
         let end = stripped
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(stripped.len());
-        let parsed = if end > 0 {
-            stripped[..end].parse::<u32>().ok()
-        } else {
-            None
-        };
-        if let Some(as_num) = parsed {
+        if starts_word
+            && end > 0
+            && let Ok(as_num) = stripped[..end].parse::<u32>()
+        {
             return Some(as_num);
         }
-        rest = stripped;
+        search_from = idx + 2;
     }
 
     None
@@ -941,6 +1064,142 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_private_dir_creates_0700_and_rejects_shared_or_foreign() {
+        use std::os::unix::fs::PermissionsExt;
+        let euid = unsafe { libc::geteuid() };
+        let base =
+            std::env::temp_dir().join(format!("whois-rdap-priv-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Fresh directory: created private.
+        let dir = base.join("fresh");
+        ensure_private_dir(&dir, euid).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Pre-existing but group/world accessible: refused.
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private_dir(&open, euid).is_err());
+
+        // Owned by someone else: refused.
+        assert!(ensure_private_dir(&dir, euid.wrapping_add(1)).is_err());
+
+        // A symlink to a private dir: refused (symlink_metadata, not followed).
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(ensure_private_dir(&link, euid).is_err());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_registry_urls_match_listing_and_arin_uses_registry_path() {
+        for (reg, label, base) in RdapRegistry::all() {
+            assert_eq!(*base, reg.base_url());
+            assert_eq!(*label, reg.label());
+            assert!(!base.ends_with('/'));
+        }
+        // Regression: ARIN's RDAP service lives under /registry; /rdap is a 404.
+        assert_eq!(
+            RdapRegistry::ARIN.base_url(),
+            "https://rdap.arin.net/registry"
+        );
+    }
+
+    #[test]
+    fn test_cacheable_ip_range_requires_range_to_contain_ip() {
+        let res = |s: &str, e: &str| parse_ip_response(json!({"startAddress": s, "endAddress": e}));
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+
+        assert!(cacheable_ip_range(ip, &res("8.8.8.0", "8.8.8.255")).is_some());
+        // Range that does not contain the queried IP (e.g. a followed link
+        // describing another network) must not become a range entry.
+        assert!(cacheable_ip_range(ip, &res("0.0.0.0", "8.8.8.7")).is_none());
+        // Reversed bounds.
+        assert!(cacheable_ip_range(ip, &res("8.8.8.255", "8.8.8.0")).is_none());
+        // Mixed / wrong family.
+        assert!(cacheable_ip_range(ip, &res("::", "ffff::")).is_none());
+        assert!(cacheable_ip_range(ip, &res("8.8.8.0", "::ffff")).is_none());
+        // Garbage.
+        assert!(cacheable_ip_range(ip, &res("x", "y")).is_none());
+        assert!(cacheable_ip_range(ip, &parse_ip_response(json!({}))).is_none());
+    }
+
+    #[test]
+    fn test_sanitize_for_terminal() {
+        assert!(matches!(
+            sanitize_for_terminal("Google LLC"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            sanitize_for_terminal("Evil\u{1b}[2J Corp"),
+            "Evil\u{FFFD}[2J Corp"
+        );
+        assert_eq!(
+            sanitize_for_terminal("a\nCountry Code: XX"),
+            "a\u{FFFD}Country Code: XX"
+        );
+        assert_eq!(sanitize_for_terminal("\u{9b}31m"), "\u{FFFD}31m"); // C1 CSI
+        assert_eq!(sanitize_for_terminal("abc\u{202E}fed"), "abc\u{FFFD}fed");
+        assert_eq!(sanitize_for_terminal("münchen.de"), "münchen.de");
+    }
+
+    #[test]
+    fn test_as_number_values_are_not_truncated() {
+        // 2^32 + 15169 used to be cast with `as u32` and come out as 15169.
+        let too_big = 4_294_967_296u64 + 15169;
+        assert_eq!(
+            extract_as_number(&json!({"arin_originas0_originautnums": [too_big]})),
+            None
+        );
+        assert_eq!(
+            extract_as_number(&json!({"autnums": [{"startAutnum": too_big}]})),
+            None
+        );
+        assert_eq!(
+            extract_as_number(&json!({"arin_originas0_originautnums": [too_big, 15169]})),
+            Some(15169)
+        );
+    }
+
+    #[test]
+    fn test_entity_handles_need_explicit_as_prefix() {
+        // Numeric contact/org handles are not AS numbers.
+        let json = json!({"entities": [{"handle": "12345-ARIN"}, {"handle": "ASTRA-RIPE"}]});
+        assert_eq!(extract_as_number(&json), None);
+        let json = json!({"entities": [{"entities": [{"handle": "987"}]}]});
+        assert_eq!(extract_as_number(&json), None);
+        // A real AS handle still works.
+        let json = json!({"entities": [{"handle": "AS15169-ARIN"}]});
+        assert_eq!(extract_as_number(&json), Some(15169));
+        assert_eq!(parse_as_handle("AS15169"), Some(15169));
+        assert_eq!(parse_as_handle("AS12ABC"), None);
+    }
+
+    #[test]
+    fn test_extract_as_from_text_requires_word_start() {
+        assert_eq!(extract_as_from_text("GAS12 CLASS3"), None);
+        assert_eq!(extract_as_from_text("GAS12 then AS64500"), Some(64500));
+        assert_eq!(extract_as_from_text("AS"), None);
+        assert_eq!(extract_as_from_text("über AS7"), Some(7));
+    }
+
+    #[tokio::test]
+    async fn test_within_deadline_times_out_and_passes_through() {
+        let past = tokio::time::Instant::now();
+        let never = std::future::pending::<Result<()>>();
+        let err = within_deadline(past, never).await.unwrap_err();
+        assert!(err.to_string().contains("total time limit"));
+
+        let later = lookup_deadline(Duration::from_secs(5));
+        assert_eq!(within_deadline(later, async { Ok(7) }).await.unwrap(), 7);
+    }
 
     #[test]
     fn test_rdap_registry_from_str() {

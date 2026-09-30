@@ -12,9 +12,9 @@ use whois_rdap::{
     QueryTarget, RdapClient, RdapRegistry, build_reqwest_client,
     bulk::{bulk_lookup, read_targets_file},
     cache::{Cache, key_asn, key_domain, key_ip},
-    classify_query,
-    redirect::follow_links,
-    resolve_base_url,
+    classify_query, lookup_deadline,
+    redirect::follow_links_until,
+    resolve_base_url, sanitize_for_terminal as t, within_deadline,
 };
 
 // ── CLI definition ─────────────────────────────────────────────────────────
@@ -52,8 +52,8 @@ struct Args {
     #[arg(long, action)]
     list_servers: bool,
 
-    /// Request timeout in seconds.
-    #[arg(long, default_value_t = 15)]
+    /// Request timeout in seconds (minimum 1).
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
 
     /// Print successful lookup output as compact JSON (one line per result).
@@ -67,8 +67,8 @@ struct Args {
     file: Option<String>,
 
     /// Max concurrent lookups when processing multiple targets (default: 8).
-    #[arg(long, default_value_t = 8)]
-    concurrency: usize,
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    concurrency: u64,
 
     // ── Bootstrap options ─────────────────────────────────────────────────
     /// Skip IANA bootstrap triage; use --rir or --server explicitly.
@@ -98,7 +98,7 @@ struct Args {
 
     // ── Redirect options ──────────────────────────────────────────────────
     /// Max RDAP link hops to follow (0 = disabled, default: 1, max: 3).
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
     max_redirects: u8,
 }
 
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
         match Cache::open() {
             Ok(c) => Some(c),
             Err(e) => {
-                eprintln!("cache: failed to open ({e}); running without cache");
+                eprintln!("cache: failed to open ({e:#}); running without cache");
                 None
             }
         }
@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
         match whois_rdap::bootstrap::BootstrapMap::load(&boot_http, args.refresh_bootstrap).await {
             Ok(map) => Some(Arc::new(map)),
             Err(e) => {
-                eprintln!("bootstrap: failed to load ({e}); falling back to default servers");
+                eprintln!("bootstrap: failed to load ({e:#}); falling back to default servers");
                 None
             }
         }
@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
             cache,
             bootstrap: bootstrap_map,
             timeout,
-            max_redirects: args.max_redirects.min(3),
+            max_redirects: args.max_redirects,
             cache_ttl_ip: args.cache_ttl_ip,
             cache_ttl_domain: args.cache_ttl_domain,
             cache_ttl_asn: args.cache_ttl_asn,
@@ -177,7 +177,20 @@ async fn main() -> Result<()> {
             active_queries: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let mut writer = stdout.lock();
-        bulk_lookup(ctx, targets.into_iter(), args.concurrency, &mut writer).await?;
+        let failures = bulk_lookup(
+            ctx,
+            targets.into_iter(),
+            args.concurrency as usize,
+            &mut writer,
+        )
+        .await?;
+        drop(writer);
+        if failures > 0 {
+            // Every failure is already on stdout as an NDJSON error line; the
+            // exit status lets scripts notice without parsing the stream.
+            eprintln!("{failures} lookup(s) failed");
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -190,10 +203,25 @@ async fn main() -> Result<()> {
         args.rir,
         bootstrap_map.as_deref(),
     );
+    if let QueryTarget::Domain(ref domain) = target
+        && args.server.is_none()
+        && args.rir.is_none()
+        && let Some(ref map) = bootstrap_map
+        && map.find_domain(domain).is_none()
+    {
+        let tld = domain.rsplit('.').next().unwrap_or(domain);
+        eprintln!(
+            "note: IANA lists no RDAP server for .{}; this registry may not offer RDAP. \
+             Trying {base_url}; use --server <URL> if you know one.",
+            t(tld)
+        );
+    }
     let client = RdapClient::for_custom(&base_url, timeout)?;
-    let max_redirects = args.max_redirects.min(3);
+    let max_redirects = args.max_redirects;
 
     let mut handle = stdout.lock();
+    // Bounds the whole lookup, including HTTP redirects and RDAP link hops.
+    let deadline = lookup_deadline(timeout);
 
     match target {
         QueryTarget::Ip(ip) => {
@@ -211,7 +239,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            match client.lookup_ip(ip).await {
+            match within_deadline(deadline, client.lookup_ip(ip)).await {
                 Ok(mut res) => {
                     // Optionally follow RDAP links for richer data. If a
                     // redirect was actually followed, the data came from a
@@ -221,10 +249,11 @@ async fn main() -> Result<()> {
                     // `followed_from` already tells us whether a hop happened,
                     // which is what the old `followed != res.raw` compare (and
                     // its full-document clone) was there to determine.
-                    let (followed, followed_from) = follow_links(
+                    let (followed, followed_from) = follow_links_until(
                         client.http_client(),
                         std::mem::take(&mut res.raw),
                         max_redirects,
+                        Some(deadline),
                     )
                     .await;
                     let res = if followed_from.is_some() {
@@ -238,9 +267,9 @@ async fn main() -> Result<()> {
                     // Store range bounds so future lookups for any IP in the
                     // same allocation are served from cache (no network call).
                     if let Some(ref c) = cache {
-                        let range_bounds = res.range.as_ref().and_then(|(s, e)| {
-                            Some((s.parse::<IpAddr>().ok()?, e.parse::<IpAddr>().ok()?))
-                        });
+                        // Only a range that really contains the queried IP may
+                        // answer future lookups for other IPs in it.
+                        let range_bounds = whois_rdap::cacheable_ip_range(ip, &res);
                         c.insert_ip_background(cache_key, &res.raw, range_bounds, ttl);
                     }
                     print_ip_result(&mut handle, ip, effective_server, &res, args.json)?;
@@ -261,12 +290,13 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            match client.lookup_domain(&domain).await {
+            match within_deadline(deadline, client.lookup_domain(&domain)).await {
                 Ok(mut res) => {
-                    let (followed, followed_from) = follow_links(
+                    let (followed, followed_from) = follow_links_until(
                         client.http_client(),
                         std::mem::take(&mut res.raw),
                         max_redirects,
+                        Some(deadline),
                     )
                     .await;
                     let res = if followed_from.is_some() {
@@ -297,12 +327,13 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            match client.lookup_asn(asn).await {
+            match within_deadline(deadline, client.lookup_asn(asn)).await {
                 Ok(mut res) => {
-                    let (followed, followed_from) = follow_links(
+                    let (followed, followed_from) = follow_links_until(
                         client.http_client(),
                         std::mem::take(&mut res.raw),
                         max_redirects,
+                        Some(deadline),
                     )
                     .await;
                     let res = if followed_from.is_some() {
@@ -348,23 +379,23 @@ fn print_ip_result<W: Write>(
         writeln!(w)?;
     } else {
         writeln!(w, "IP:           {}", ip)?;
-        writeln!(w, "RDAP Server:  {}", server)?;
+        writeln!(w, "RDAP Server:  {}", t(server))?;
         writeln!(
             w,
             "Organization: {}",
-            res.organization.as_deref().unwrap_or("Unknown")
+            t(res.organization.as_deref().unwrap_or("Unknown"))
         )?;
         if let Some(ref cc) = res.country_code {
-            writeln!(w, "Country Code: {}", cc)?;
+            writeln!(w, "Country Code: {}", t(cc))?;
         }
         if let Some(n) = res.as_number {
             writeln!(w, "AS Number:    AS{}", n)?;
         }
         if !res.cidrs.is_empty() {
-            writeln!(w, "CIDR(s):      {}", res.cidrs.join(", "))?;
+            writeln!(w, "CIDR(s):      {}", t(&res.cidrs.join(", ")))?;
         }
         if let Some((ref s, ref e)) = res.range {
-            writeln!(w, "Range:        {} - {}", s, e)?;
+            writeln!(w, "Range:        {} - {}", t(s), t(e))?;
         }
         if res.cidrs.is_empty() && res.range.is_none() {
             writeln!(w, "CIDR/Range:   Not found in RDAP response")?;
@@ -392,24 +423,24 @@ fn print_domain_result<W: Write>(
         serde_json::to_writer(&mut *w, &out)?;
         writeln!(w)?;
     } else {
-        writeln!(w, "Domain:       {}", res.handle)?;
-        writeln!(w, "RDAP Server:  {}", server)?;
+        writeln!(w, "Domain:       {}", t(&res.handle))?;
+        writeln!(w, "RDAP Server:  {}", t(server))?;
         writeln!(
             w,
             "Organization: {}",
-            res.organization.as_deref().unwrap_or("Unknown")
+            t(res.organization.as_deref().unwrap_or("Unknown"))
         )?;
         if let Some(ref r) = res.registrar {
-            writeln!(w, "Registrar:    {}", r)?;
+            writeln!(w, "Registrar:    {}", t(r))?;
         }
         if let Some(ref cc) = res.country_code {
-            writeln!(w, "Country Code: {}", cc)?;
+            writeln!(w, "Country Code: {}", t(cc))?;
         }
         if !res.nameservers.is_empty() {
-            writeln!(w, "Name Servers: {}", res.nameservers.join(", "))?;
+            writeln!(w, "Name Servers: {}", t(&res.nameservers.join(", ")))?;
         }
         if !res.status.is_empty() {
-            writeln!(w, "Status:       {}", res.status.join(", "))?;
+            writeln!(w, "Status:       {}", t(&res.status.join(", ")))?;
         }
     }
     Ok(())
@@ -433,14 +464,14 @@ fn print_asn_result<W: Write>(
         writeln!(w)?;
     } else {
         writeln!(w, "ASN:          AS{}", res.asn)?;
-        writeln!(w, "RDAP Server:  {}", server)?;
+        writeln!(w, "RDAP Server:  {}", t(server))?;
         writeln!(
             w,
             "Organization: {}",
-            res.organization.as_deref().unwrap_or("Unknown")
+            t(res.organization.as_deref().unwrap_or("Unknown"))
         )?;
         if let Some(ref cc) = res.country_code {
-            writeln!(w, "Country Code: {}", cc)?;
+            writeln!(w, "Country Code: {}", t(cc))?;
         }
         if let Some((s, e)) = res.range {
             if s == e {
@@ -454,7 +485,16 @@ fn print_asn_result<W: Write>(
 }
 
 fn handle_error(e: anyhow::Error) -> Result<()> {
-    eprintln!("Error: {e}");
+    // `{:#}` prints the whole context chain ("Failed to GET …: dns error: …"),
+    // not just the outermost message.
+    // The message can embed a remote server's error body: print it line by
+    // line, sanitising each line, so it cannot inject terminal escapes.
+    let msg = format!("{e:#}");
+    let mut lines = msg.lines();
+    eprintln!("Error: {}", t(lines.next().unwrap_or("")));
+    for line in lines {
+        eprintln!("{}", t(line));
+    }
     eprintln!("Tip: If the target belongs to another registry/RIR, try one of:");
     for (reg, label, base) in RdapRegistry::all() {
         eprintln!(

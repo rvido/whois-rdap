@@ -33,6 +33,19 @@ pub async fn follow_links(
     json: Value,
     max_hops: u8,
 ) -> (Value, Option<String>) {
+    follow_links_until(http, json, max_hops, None).await
+}
+
+/// Like `follow_links`, but stops following once `deadline` passes. A hop
+/// that runs out of time is treated like any failed hop: the JSON obtained so
+/// far is returned, so a slow sub-registry never costs the answer we already
+/// have.
+pub async fn follow_links_until(
+    http: &reqwest::Client,
+    json: Value,
+    max_hops: u8,
+    deadline: Option<tokio::time::Instant>,
+) -> (Value, Option<String>) {
     if max_hops == 0 {
         return (json, None);
     }
@@ -42,16 +55,35 @@ pub async fn follow_links(
     let self_href = extract_self_href(&json);
 
     if let Some(href) = find_follow_href(&json, self_href) {
-        match fetch_href(http, href).await {
+        let fetch = async {
+            match deadline {
+                Some(d) => crate::within_deadline(d, fetch_href(http, href)).await,
+                None => fetch_href(http, href).await,
+            }
+        };
+        match fetch.await {
+            // A `related` link may point at a different kind of object (a
+            // contact entity, a parent autnum, …). Replacing an IP-network
+            // answer with that would print — and cache — the wrong record.
+            Ok(next_json) if !same_object_class(&json, &next_json) => {
+                eprintln!(
+                    "redirect: ignoring '{}': it describes a different kind of RDAP object",
+                    crate::sanitize_for_terminal(href)
+                );
+            }
             Ok(next_json) => {
                 // Recurse for additional hops; decrement counter.
                 let href = href.to_string();
                 let (final_json, deeper_href) =
-                    Box::pin(follow_links(http, next_json, max_hops - 1)).await;
+                    Box::pin(follow_links_until(http, next_json, max_hops - 1, deadline)).await;
                 return (final_json, Some(deeper_href.unwrap_or(href)));
             }
             Err(e) => {
-                eprintln!("redirect: failed to follow '{}': {e}", href);
+                eprintln!(
+                    "redirect: failed to follow '{}': {}",
+                    crate::sanitize_for_terminal(href),
+                    crate::sanitize_for_terminal(&format!("{e:#}"))
+                );
             }
         }
     }
@@ -60,6 +92,21 @@ pub async fn follow_links(
 }
 
 // ── Internals ────────────────────────────────────────────────────────────────
+
+/// True if `next` has the same RDAP `objectClassName` as `current`
+/// (e.g. both "ip network"). If `current` has none, there is nothing to
+/// compare against and any object is accepted.
+fn same_object_class(current: &Value, next: &Value) -> bool {
+    let class = |v: &Value| {
+        v.get("objectClassName")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    match class(current) {
+        Some(c) => class(next).is_some_and(|n| n.eq_ignore_ascii_case(&c)),
+        None => true,
+    }
+}
 
 /// Extract the "self" href from the links array, if present.
 fn extract_self_href(json: &Value) -> Option<&str> {
@@ -146,6 +193,24 @@ async fn fetch_href(http: &reqwest::Client, href: &str) -> Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_same_object_class() {
+        let ip = json!({"objectClassName": "ip network"});
+        assert!(same_object_class(
+            &ip,
+            &json!({"objectClassName": "IP Network"})
+        ));
+        assert!(!same_object_class(
+            &ip,
+            &json!({"objectClassName": "entity"})
+        ));
+        assert!(!same_object_class(&ip, &json!({})));
+        assert!(same_object_class(
+            &json!({}),
+            &json!({"objectClassName": "entity"})
+        ));
+    }
 
     #[test]
     fn test_no_links_returns_original() {

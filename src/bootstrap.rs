@@ -7,6 +7,7 @@
 //   https://data.iana.org/rdap/ipv4.json
 //   https://data.iana.org/rdap/ipv6.json
 //   https://data.iana.org/rdap/asn.json
+//   https://data.iana.org/rdap/dns.json
 //
 // The map lives in-process as three sorted prefix arrays. Lookup is a linear
 // scan for the longest covering prefix (O(N), zero heap allocation) — the
@@ -31,6 +32,7 @@ pub const BOOTSTRAP_TTL_SECS: u64 = 86_400;
 const IANA_IPV4_URL: &str = "https://data.iana.org/rdap/ipv4.json";
 const IANA_IPV6_URL: &str = "https://data.iana.org/rdap/ipv6.json";
 const IANA_ASN_URL: &str = "https://data.iana.org/rdap/asn.json";
+const IANA_DNS_URL: &str = "https://data.iana.org/rdap/dns.json";
 
 // ── Internal serde model (only used during parsing, not retained) ────────────
 
@@ -52,6 +54,8 @@ pub struct BootstrapMap {
     ipv4: Vec<(Ipv4Net, Box<str>)>,
     ipv6: Vec<(Ipv6Net, Box<str>)>,
     asn: Vec<(RangeInclusive<u32>, Box<str>)>,
+    /// Lowercase A-label TLD (or longer suffix) → base URL.
+    dns: Vec<(Box<str>, Box<str>)>,
 }
 
 impl BootstrapMap {
@@ -66,31 +70,50 @@ impl BootstrapMap {
                 format!("Cannot create bootstrap cache dir: {}", cache_dir.display())
             })?;
 
-        let ipv4_path = cache_dir.join("ipv4.json");
-        let ipv6_path = cache_dir.join("ipv6.json");
-        let asn_path = cache_dir.join("asn.json");
-
         // Refresh stale or missing files, tolerating a failed refresh when a
         // usable (if stale) copy is already on disk — see `refresh_or_keep_stale`.
-        refresh_or_keep_stale(http, &ipv4_path, IANA_IPV4_URL, force_refresh).await?;
-        refresh_or_keep_stale(http, &ipv6_path, IANA_IPV6_URL, force_refresh).await?;
-        refresh_or_keep_stale(http, &asn_path, IANA_ASN_URL, force_refresh).await?;
+        // Each download is parsed before it replaces the on-disk copy, so a
+        // bad response (an HTML error page served with 200, a truncated body)
+        // can never overwrite a good file.
+        let ipv4 = load_one(
+            http,
+            &cache_dir.join("ipv4.json"),
+            IANA_IPV4_URL,
+            force_refresh,
+            parse_ipv4_bootstrap,
+        )
+        .await?;
+        let ipv6 = load_one(
+            http,
+            &cache_dir.join("ipv6.json"),
+            IANA_IPV6_URL,
+            force_refresh,
+            parse_ipv6_bootstrap,
+        )
+        .await?;
+        let asn = load_one(
+            http,
+            &cache_dir.join("asn.json"),
+            IANA_ASN_URL,
+            force_refresh,
+            parse_asn_bootstrap,
+        )
+        .await?;
+        let dns = load_one(
+            http,
+            &cache_dir.join("dns.json"),
+            IANA_DNS_URL,
+            force_refresh,
+            parse_dns_bootstrap,
+        )
+        .await?;
 
-        // Parse (sync — files are small, < 50 KB each)
-        let ipv4 = parse_ipv4_bootstrap(
-            &std::fs::read(&ipv4_path)
-                .with_context(|| format!("Cannot read {}", ipv4_path.display()))?,
-        )?;
-        let ipv6 = parse_ipv6_bootstrap(
-            &std::fs::read(&ipv6_path)
-                .with_context(|| format!("Cannot read {}", ipv6_path.display()))?,
-        )?;
-        let asn = parse_asn_bootstrap(
-            &std::fs::read(&asn_path)
-                .with_context(|| format!("Cannot read {}", asn_path.display()))?,
-        )?;
-
-        Ok(Self { ipv4, ipv6, asn })
+        Ok(Self {
+            ipv4,
+            ipv6,
+            asn,
+            dns,
+        })
     }
 
     /// Longest-prefix-match lookup shared by `find_ip` and `find_ip_prefix`.
@@ -141,6 +164,25 @@ impl BootstrapMap {
             .find(|(range, _)| range.contains(&asn))
             .map(|(_, url)| url.as_ref())
     }
+
+    /// Find the RDAP base URL for a domain name (A-label form).
+    ///
+    /// Matches the longest bootstrap entry that is a whole-label suffix of
+    /// `domain` (RFC 9224 §4), so "example.co.uk" prefers a "co.uk" entry
+    /// over "uk", and "notuk" never matches "uk".
+    pub fn find_domain(&self, domain: &str) -> Option<&str> {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        self.dns
+            .iter()
+            .filter(|(suffix, _)| {
+                domain == **suffix
+                    || domain
+                        .strip_suffix(&**suffix)
+                        .is_some_and(|rest| rest.ends_with('.'))
+            })
+            .max_by_key(|(suffix, _)| suffix.len())
+            .map(|(_, url)| url.as_ref())
+    }
 }
 
 // ── Bootstrap file management ────────────────────────────────────────────────
@@ -150,47 +192,71 @@ fn bootstrap_cache_dir() -> Result<PathBuf> {
     Ok(base.join("bootstrap"))
 }
 
-/// Refresh `path`, but fall back to an existing stale copy if the download
-/// fails.
+/// Make sure `path` holds a fresh, valid bootstrap file and return it parsed.
 ///
-/// Losing the network should degrade bootstrap routing to "slightly out of
-/// date", not to "no routing at all" — IANA delegations change rarely, so a
-/// stale map is far better than none.
-async fn refresh_or_keep_stale(
+/// If the download fails, or returns something `parse` rejects, an existing
+/// on-disk copy is used instead (stale if need be). Losing the network should
+/// degrade bootstrap routing to "slightly out of date", not to "no routing at
+/// all" — IANA delegations change rarely, so a stale map is far better than
+/// none.
+async fn load_one<T>(
     http: &reqwest::Client,
     path: &std::path::Path,
     url: &str,
     force: bool,
-) -> Result<()> {
-    match refresh_file(http, path, url, force).await {
-        Ok(()) => Ok(()),
+    parse: fn(&[u8]) -> Result<T>,
+) -> Result<T> {
+    // A fresh on-disk copy that still parses needs no network at all. A fresh
+    // copy that does NOT parse (e.g. written by an older version without this
+    // check) is treated as missing and re-downloaded.
+    if !force && is_fresh(path) {
+        match read_and_parse(path, parse) {
+            Ok(v) => return Ok(v),
+            Err(e) => eprintln!(
+                "bootstrap: cached {} is unusable ({e:#}); re-downloading",
+                path.display()
+            ),
+        }
+    }
+
+    match download(http, url, parse).await {
+        Ok((bytes, parsed)) => {
+            if let Err(e) = write_atomic(path, &bytes) {
+                // Still usable for this run; just not persisted.
+                eprintln!("bootstrap: could not save {} ({e:#})", path.display());
+            }
+            Ok(parsed)
+        }
         Err(e) if path.exists() => {
-            eprintln!("bootstrap: refresh of {url} failed ({e}); using stale cached copy");
-            Ok(())
+            eprintln!("bootstrap: refresh of {url} failed ({e:#}); using stale cached copy");
+            read_and_parse(path, parse)
         }
         Err(e) => Err(e),
     }
 }
 
-async fn refresh_file(
-    http: &reqwest::Client,
-    path: &std::path::Path,
-    url: &str,
-    force: bool,
-) -> Result<()> {
-    if !force
-        && path.exists()
-        && let Ok(meta) = std::fs::metadata(path)
-        && let Ok(modified) = meta.modified()
-    {
-        let age = SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or(Duration::MAX);
-        if age < Duration::from_secs(BOOTSTRAP_TTL_SECS) {
-            return Ok(());
-        }
-    }
+fn is_fresh(path: &std::path::Path) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::MAX);
+    age < Duration::from_secs(BOOTSTRAP_TTL_SECS)
+}
 
+fn read_and_parse<T>(path: &std::path::Path, parse: fn(&[u8]) -> Result<T>) -> Result<T> {
+    let bytes = std::fs::read(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    parse(&bytes).with_context(|| format!("Cannot parse {}", path.display()))
+}
+
+/// Download `url` and parse it; returns the raw bytes (to persist) and the
+/// parsed value. Nothing is written unless parsing succeeded.
+async fn download<T>(
+    http: &reqwest::Client,
+    url: &str,
+    parse: fn(&[u8]) -> Result<T>,
+) -> Result<(Vec<u8>, T)> {
     let parsed_url =
         reqwest::Url::parse(url).with_context(|| format!("Invalid bootstrap URL: {url}"))?;
     let fetched = crate::http::get_guarded(http, parsed_url, None).await?;
@@ -200,16 +266,21 @@ async fn refresh_file(
             fetched.status
         ));
     }
-    let bytes = fetched.body;
+    let parsed =
+        parse(&fetched.body).with_context(|| format!("Invalid bootstrap data from {url}"))?;
+    Ok((fetched.body, parsed))
+}
 
-    // Write atomically via temp file → rename
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes)
+/// Write via a per-process temp file + rename, so concurrent runs never
+/// interleave writes and readers never see a half-written file.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes)
         .with_context(|| format!("Cannot write bootstrap temp file: {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("Cannot rename bootstrap file: {}", path.display()))?;
-
-    Ok(())
+    std::fs::rename(&tmp, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Cannot rename bootstrap file: {}", path.display())
+    })
 }
 
 // ── Parsers (no allocation of intermediate Strings beyond what's kept) ───────
@@ -265,6 +336,25 @@ fn parse_asn_bootstrap(data: &[u8]) -> Result<Vec<(RangeInclusive<u32>, Box<str>
         }
     }
     out.sort_by_key(|(range, _)| *range.start());
+    Ok(out)
+}
+
+fn parse_dns_bootstrap(data: &[u8]) -> Result<Vec<(Box<str>, Box<str>)>> {
+    let parsed: BootstrapFile =
+        serde_json::from_slice(data).context("Invalid DNS bootstrap JSON")?;
+    let mut out = Vec::new();
+    for (suffixes, urls) in &parsed.services {
+        let url = best_url(urls).ok_or_else(|| anyhow!("DNS bootstrap entry has no URLs"))?;
+        for suffix in suffixes {
+            let suffix = suffix.trim_matches('.').to_ascii_lowercase();
+            if !suffix.is_empty() {
+                out.push((suffix.into_boxed_str(), url.into()));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!("DNS bootstrap has no entries"));
+    }
     Ok(out)
 }
 
@@ -324,6 +414,11 @@ mod tests {
                 (1..=9999, "https://arin.example".into()),
                 (15169..=15169, "https://google.example".into()),
             ],
+            dns: vec![
+                ("com".into(), "https://verisign.example/com/v1/".into()),
+                ("uk".into(), "https://nominet.example/".into()),
+                ("co.uk".into(), "https://co-uk.example/".into()),
+            ],
         }
     }
 
@@ -369,5 +464,68 @@ mod tests {
     fn test_parse_asn_range() {
         assert_eq!(parse_asn_range("100-200").unwrap(), (100, 200));
         assert_eq!(parse_asn_range("15169").unwrap(), (15169, 15169));
+    }
+
+    #[test]
+    fn test_find_domain_matches_whole_label_suffix() {
+        let map = make_map();
+        assert_eq!(
+            map.find_domain("google.com"),
+            Some("https://verisign.example/com/v1/")
+        );
+        assert_eq!(
+            map.find_domain("GOOGLE.COM."),
+            Some("https://verisign.example/com/v1/")
+        );
+        assert_eq!(
+            map.find_domain("com"),
+            Some("https://verisign.example/com/v1/")
+        );
+        // "notcom" must not match the "com" entry.
+        assert_eq!(map.find_domain("example.notcom"), None);
+    }
+
+    #[test]
+    fn test_find_domain_prefers_longest_suffix() {
+        let map = make_map();
+        assert_eq!(map.find_domain("bbc.co.uk"), Some("https://co-uk.example/"));
+        assert_eq!(
+            map.find_domain("example.org.uk"),
+            Some("https://nominet.example/")
+        );
+    }
+
+    #[test]
+    fn test_parse_dns_bootstrap() {
+        let data = br#"{"services":[[["COM","net"],["http://x.example/","https://y.example/"]]]}"#;
+        let parsed = parse_dns_bootstrap(data).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(&*parsed[0].0, "com");
+        assert_eq!(&*parsed[0].1, "https://y.example/");
+    }
+
+    /// Regression: a bad download (e.g. an HTML error page served with 200)
+    /// used to be written to disk before parsing, disabling bootstrap routing
+    /// until the file aged out. Parsers must reject it so it is never saved.
+    #[test]
+    fn test_parsers_reject_non_json_payloads() {
+        let html = b"<html><body>Service Unavailable</body></html>";
+        assert!(parse_ipv4_bootstrap(html).is_err());
+        assert!(parse_ipv6_bootstrap(html).is_err());
+        assert!(parse_asn_bootstrap(html).is_err());
+        assert!(parse_dns_bootstrap(html).is_err());
+        assert!(parse_dns_bootstrap(br#"{"services":[]}"#).is_err());
+    }
+
+    #[test]
+    fn test_read_and_parse_falls_back_cleanly_on_corrupt_file() {
+        let dir = std::env::temp_dir().join(format!("whois-rdap-boot-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dns.json");
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(read_and_parse(&path, parse_dns_bootstrap).is_err());
+        write_atomic(&path, br#"{"services":[[["com"],["https://y.example/"]]]}"#).unwrap();
+        assert_eq!(read_and_parse(&path, parse_dns_bootstrap).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
