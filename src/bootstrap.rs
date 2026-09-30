@@ -1,5 +1,5 @@
 // IANA Bootstrap Triage Map (Feature 2)
-// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under MIT or Apache-2.0.
 //
 // Routes an IP/Domain/ASN query to the correct authoritative RDAP server by
 // consulting locally-cached IANA bootstrap JSON files:

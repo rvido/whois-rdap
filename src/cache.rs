@@ -1,5 +1,5 @@
 // SQLite Result Cache (Feature 4)
-// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under MIT or Apache-2.0.
 //
 // Schema (single table, WAL mode):
 //   rdap_cache(key TEXT PK, payload BLOB, fetched_at INTEGER, ttl INTEGER)

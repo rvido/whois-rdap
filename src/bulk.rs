@@ -1,5 +1,5 @@
 // Parallel Bulk Lookup (Feature 1)
-// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under MIT or Apache-2.0.
 //
 // Executes N RDAP lookups concurrently using `futures::stream::buffer_unordered`.
 // Only `concurrency` responses are in-flight (and in memory) at any one time —

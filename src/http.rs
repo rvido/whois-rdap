@@ -1,5 +1,5 @@
 // Guarded HTTP fetch layer
-// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under MIT or Apache-2.0.
 //
 // Every outbound HTTP request in this crate goes through `get_guarded`, which
 // provides two protections that `reqwest` does not give us by default:

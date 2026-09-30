@@ -1,5 +1,5 @@
 // Smart Redirect Follower (Feature 3)
-// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under MIT or Apache-2.0.
 //
 // RDAP responses may contain a `links` array pointing to related or
 // authoritative sub-registry resources.  This module inspects the `links`

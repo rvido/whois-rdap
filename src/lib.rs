@@ -1,5 +1,5 @@
 // Rust RDAP client library to query RDAP servers for IP address information.
-// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under MIT or Apache-2.0.
 
 pub mod bootstrap;
 pub mod bulk;

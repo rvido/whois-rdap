@@ -1,5 +1,5 @@
 // A command-line tool to query RDAP servers for IP, Domain, and ASN information.
-// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under the MIT license.
+// Copyright (c) 2025-2026 Richard Vidal Dorsch. Licensed under MIT or Apache-2.0.
 
 use anyhow::Result;
 use clap::{ArgGroup, Parser, ValueHint};
