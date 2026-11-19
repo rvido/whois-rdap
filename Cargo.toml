@@ -1,6 +1,6 @@
 [package]
 name = "whois-rdap"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -62,7 +62,7 @@ idna = "1"
 # so any two crates in the same dependency graph pulling in different
 # libsqlite3-sys versions fail to resolve at all (this bit AncileNet, which
 # depends on both this crate and lanwatch).
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # Feature 1 — parallel bulk streaming via buffer_unordered
 futures = { version = "0.3", default-features = false, features = ["std"] }

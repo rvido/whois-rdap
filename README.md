@@ -325,6 +325,11 @@ whois-rdap = { path = "." }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
+`whois-rdap` depends on `rusqlite` 0.43 (`libsqlite3-sys` 0.40, bundled SQLite).
+`libsqlite3-sys` sets `links = "sqlite3"`, so only one version of it can exist
+in a dependency graph. If your project also uses `rusqlite`, use a version that
+pulls in the same `libsqlite3-sys` (rusqlite 0.43), or Cargo will fail to resolve.
+
 ### Single lookup
 
 ```rust
